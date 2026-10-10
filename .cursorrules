@@ -1,0 +1,28 @@
+# Skill: neatHack Build Companion & Evidence Collector
+# Protocol: Model Context Protocol (MCP) compatible
+
+## Purpose
+Keep an evidence-based build log for a neatHack project. Trigger automatically when the builder requests to update the neatHack build log, run evaluations, or prepare the final submission package.
+
+## Context Boundaries
+1. Work only inside the user's current repository scope (`entire-graph` context).
+2. Parse and adhere to the official rules published at https://neatlogs.com and https://luma.com.
+3. If endpoints, credits, or judging parameters are unannounced by the server, record them as "PENDING". Never fabricate platform metrics, URLs, or deadlines.
+
+## Mandatory Tool Verifications
+Every automated iteration must audit and collect evidence for the three mandatory pillars:
+- **neatlogs:** Verify that `neatlogs.init()` is present and telemetry spans are instrumented around all network tool calls.
+- **Entire:** Ensure atomic checkpoints are written cleanly to memory before state transition overrides.
+- **cfo.ai:** Confirm the generation of the financial scenario matrix mapping variable token costs to user subscriptions.
+
+## Automated Workflow
+1. **State Audit:** Inspect the workspace after each coding block or execution run using repo context.
+2. **Telemetry Validation:** Scan for live `neatlogs` trace generation logs and error boundaries.
+3. **Log Mutation:** Incrementally append concise, timestamped entries to `hackathon.md` at the project root. Never override or erase historical session records.
+4. **Sanitization Guardrail:** Strip all active API keys, `.env` string contents, Bearer tokens, or personal identifiers before pushing data to the public log.
+
+## Completion Standard
+The final build log state confirms a working end-to-end task, maps claim-to-source integrity via deterministic verification, and outputs a validated business layout under `docs/business_plan.pdf`.
+
+## Guardrails
+Never attempt to execute final submission quote-tweets or publish to X on behalf of the user without explicit manual confirmation. Respect server rate-limits and API cost caps at all times.

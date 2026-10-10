@@ -1,0 +1,6 @@
+requests==2.34.2
+python-dotenv==1.2.4
+pydantic==2.14.0
+boto3==1.43.111
+pytest==9.1.1
+neatlogs==1.1.8
