@@ -533,6 +533,86 @@ class DisruptRadarAgent:
         return self.state
 
 
+def send_trace_v1(state: RunState, target_domain: str) -> None:
+    """Envia um trace único para https://ingest.neatlogs.com/v1/trace.
+
+    O endpoint /api/data/v2 do SDK 1.1.8 está descontinuado (404 confirmado);
+    o transporte real da plataforma é o POST /v1/trace com um objeto JSON
+    aninhado (children). Uma POST por execução, nunca por span.
+    """
+    api_key = os.getenv("NEATLOGS_API_KEY", "").strip()
+    if not api_key:
+        logger.warning("NEATLOGS_API_KEY em falta; trace não enviado.")
+        return
+
+    children = []
+    for step in state.plan:
+        child = {
+            "name": step.lower(),
+            "kind": "TOOL",
+            "tool_name": step.lower(),
+            "input": {"target_domain": target_domain},
+        }
+        if step == "FETCH_DATA":
+            child["output"] = {
+                "current_headcount": state.findings.get("current_headcount"),
+                "previous_headcount": state.findings.get("previous_headcount"),
+            }
+            step_errors = [
+                e for e in state.errors_log if e.get("step") == "FETCH_DATA"
+            ]
+            if step_errors:
+                child["logs"] = [
+                    {"level": "warning", "message": e.get("error", "")}
+                    for e in step_errors
+                ]
+        elif step == "ANALYZE_SIGNALS":
+            child["output"] = {"growth_pct": state.findings.get("growth_pct")}
+        elif step == "VERIFY_METRICS":
+            child["output"] = {"verified": state.is_verified}
+        elif step == "ASSESS_RISK":
+            child["output"] = {"risk_level": state.risk_level}
+        elif step == "RENDER_REPORT":
+            child["output"] = {"report": state.final_report[:200]}
+        children.append(child)
+
+    trace = {
+        "name": "disrupt-radar",
+        "kind": "WORKFLOW",
+        "input": {"goal": state.goal, "target_domain": target_domain},
+        "output": {
+            "risk_level": state.risk_level,
+            "verified": state.is_verified,
+            "report": state.final_report[:500],
+        },
+        "children": children,
+    }
+
+    try:
+        resp = requests.post(
+            "https://ingest.neatlogs.com/v1/trace",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=trace,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            body = resp.json()
+            logger.info(
+                "Trace enviado: %s (%s spans)",
+                body.get("trace_id"),
+                body.get("spans"),
+            )
+        else:
+            logger.warning(
+                "Falha ao enviar trace: %s %s", resp.status_code, resp.text[:200]
+            )
+    except Exception as exc:
+        logger.warning("Falha ao enviar trace: %s", exc)
+
+
 if __name__ == "__main__":
     import sys
 
@@ -546,6 +626,7 @@ if __name__ == "__main__":
         print(f"Erro: {exc}")
         raise SystemExit(2)
     final_state = agent_instance.run_agent()
+    send_trace_v1(final_state, agent_instance.target_domain)
     print("\n===== RELATÓRIO FINAL =====\n")
     print(final_state.final_report)
     print(f"\nRisco: {final_state.risk_level} | Verificado: {final_state.is_verified}")

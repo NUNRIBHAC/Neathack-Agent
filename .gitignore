@@ -7,3 +7,5 @@ __pycache__/
 .env
 *.tmp
 artifacts/
+Add-Content .gitignore "`nprobe_*.py"
+probe_*.py
