@@ -10,6 +10,8 @@ relatório executivo.
 Modos de execução:
 - RUN_DEMO_FIXTURE_MODE=true          -> dados sintéticos, sem rede
 - INJECT_LOCAL_FAULT_SIMULATION=true  -> injeta uma falha na 1.ª tentativa
+- CLI: --fixture / --fault forçam os modos acima sem tocar no .env
+- CLI: --resume <run_id> restaura o checkpoint e continua de onde parou
 """
 
 import functools
@@ -18,7 +20,9 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, List, Optional
 
 import boto3
 import requests
@@ -92,12 +96,28 @@ DEFAULT_PLAN = [
 ]
 
 
+def _parse_retry_after(value: Any) -> Optional[int]:
+    """Converte Retry-After (segundos ou data HTTP) em segundos, ou None."""
+    if not value:
+        return None
+    try:
+        return max(0, int(float(str(value).strip())))
+    except ValueError:
+        pass
+    try:
+        delta = parsedate_to_datetime(str(value).strip()) - datetime.now(timezone.utc)
+        return max(0, int(delta.total_seconds()))
+    except Exception:
+        return None
+
+
 class RunState:
     """Estado persistente do agente, com checkpoint atómico."""
 
     def __init__(self, goal: str) -> None:
         self.run_id: int = int(time.time())
         self.goal: str = goal
+        self.target_domain: str = ""
         self.plan: List[str] = []
         self.current_step_idx: int = 0
         self.evidence_ledger: List[Dict[str, Any]] = []
@@ -112,6 +132,7 @@ class RunState:
         return {
             "run_id": self.run_id,
             "goal": self.goal,
+            "target_domain": self.target_domain,
             "plan": self.plan,
             "current_step_idx": self.current_step_idx,
             "evidence_ledger": self.evidence_ledger,
@@ -135,6 +156,28 @@ class RunState:
         logger.info("Checkpoint atómico escrito em %s", final_path)
         return final_path
 
+    @classmethod
+    def load_checkpoint(cls, run_id: int) -> "RunState":
+        """Restaura um estado persistido por save_checkpoint()."""
+        final_path = os.path.join(
+            os.getcwd(), "artifacts", f"checkpoint_{run_id}.json"
+        )
+        with open(final_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        state = cls(goal=data.get("goal", ""))
+        state.run_id = int(data.get("run_id", run_id))
+        state.target_domain = data.get("target_domain", "")
+        state.plan = data.get("plan", [])
+        state.current_step_idx = int(data.get("current_step_idx", 0))
+        state.evidence_ledger = data.get("evidence_ledger", [])
+        state.findings = data.get("findings", {})
+        state.errors_log = data.get("errors_log", [])
+        state.task_attempts = data.get("task_attempts", {})
+        state.is_verified = bool(data.get("is_verified", False))
+        state.risk_level = data.get("risk_level", "UNKNOWN")
+        state.final_report = data.get("final_report", "")
+        return state
+
 
 class DisruptRadarAgent:
     """Agente autónomo de inteligência competitiva com recuperação de falhas."""
@@ -154,20 +197,37 @@ class DisruptRadarAgent:
             raise ValueError(f"target_domain com formato inválido: {domain!r}")
         return candidate
 
-    def __init__(self, goal: str, target_domain: str, max_retries: int = 3) -> None:
+    def __init__(
+        self,
+        goal: str,
+        target_domain: str,
+        max_retries: int = 3,
+        fixture_mode: Optional[bool] = None,
+        inject_fault: Optional[bool] = None,
+        state: Optional[RunState] = None,
+    ) -> None:
         self.goal = goal
         self.target_domain = self._validate_domain(target_domain)
         self.max_retries = max_retries
 
-        self.fixture_mode = (
-            os.getenv("RUN_DEMO_FIXTURE_MODE", "false").strip().lower() == "true"
-        )
-        self.inject_fault = (
-            os.getenv("INJECT_LOCAL_FAULT_SIMULATION", "false").strip().lower() == "true"
-        )
+        if fixture_mode is not None:
+            self.fixture_mode = fixture_mode
+        else:
+            self.fixture_mode = (
+                os.getenv("RUN_DEMO_FIXTURE_MODE", "false").strip().lower() == "true"
+            )
+        if inject_fault is not None:
+            self.inject_fault = inject_fault
+        else:
+            self.inject_fault = (
+                os.getenv("INJECT_LOCAL_FAULT_SIMULATION", "false").strip().lower()
+                == "true"
+            )
 
-        self.state = RunState(goal)
-        self.state.plan = DEFAULT_PLAN[:]
+        self.state = state if state is not None else RunState(goal)
+        if state is None:
+            self.state.plan = DEFAULT_PLAN[:]
+        self.state.target_domain = self.target_domain
 
         self.bedrock = boto3.client(
             service_name="bedrock-runtime",
@@ -257,7 +317,11 @@ class DisruptRadarAgent:
     # ------------------------------------------------------------------
     @span(kind="TOOL", name="fetch_data")
     def fetch_data_tool(self) -> bool:
-        """Obtém headcounts do domínio alvo (fixture ou Crustdata live)."""
+        """Obtém headcounts do domínio alvo (fixture ou Crustdata live).
+
+        Em modo live, HTTP 429 (rate limit) é registado com o valor de
+        Retry-After; o loop do run_agent usa esse valor no backoff.
+        """
         attempts = self.state.task_attempts.get("FETCH_DATA", 0)
 
         # Simulação de falha de rede na 1.ª tentativa (modo demo).
@@ -307,10 +371,24 @@ class DisruptRadarAgent:
         }
         payload = {"company_domain": self.target_domain}
 
+        resp = None
         try:
             resp = requests.post(url, json=payload, headers=headers, timeout=15)
             resp.raise_for_status()
             data = resp.json()
+        except requests.exceptions.HTTPError as exc:
+            error_entry = {
+                "step": "FETCH_DATA",
+                "attempt": attempts,
+                "error": str(exc),
+            }
+            if resp is not None and resp.status_code == 429:
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                if retry_after is not None:
+                    error_entry["retry_after"] = retry_after
+            self.state.errors_log.append(error_entry)
+            logger.error("Falha real na Crustdata: %s", exc)
+            return False
         except Exception as exc:
             self.state.errors_log.append(
                 {"step": "FETCH_DATA", "attempt": attempts, "error": str(exc)}
@@ -503,10 +581,18 @@ class DisruptRadarAgent:
     # ------------------------------------------------------------------
     @span(kind="AGENT", name="run_agent")
     def run_agent(self) -> RunState:
-        """Orquestra o plano de forma sequencial com retries e backoff."""
+        """Orquestra o plano de forma sequencial com retries e backoff.
+
+        Se o estado já veio de um checkpoint (resume), o plano e o índice
+        atual são preservados e a execução continua de onde parou.
+        O backoff respeita Retry-After em erros HTTP 429 (teto de 30s).
+        """
         logger.info("Objetivo: %s | Alvo: %s", self.goal, self.target_domain)
-        self.build_plan()
-        self.state.save_checkpoint()
+        if not self.state.plan:
+            self.build_plan()
+            self.state.save_checkpoint()
+        else:
+            logger.info("Plano já carregado do checkpoint: %s", self.state.plan)
 
         while self.state.current_step_idx < len(self.state.plan):
             step = self.state.plan[self.state.current_step_idx]
@@ -525,6 +611,16 @@ class DisruptRadarAgent:
                 self.state.save_checkpoint()
             else:
                 delay = min(1.5 * attempts, 10.0)
+                last_error = next(
+                    (
+                        e
+                        for e in reversed(self.state.errors_log)
+                        if e.get("step") == step
+                    ),
+                    None,
+                )
+                if last_error and last_error.get("retry_after") is not None:
+                    delay = min(float(last_error["retry_after"]), 30.0)
                 logger.warning("Falha em %s; backoff de %.1fs.", step, delay)
                 time.sleep(delay)
 
@@ -534,16 +630,23 @@ class DisruptRadarAgent:
 
 
 def send_trace_v1(state: RunState, target_domain: str) -> None:
-    """Envia um trace único para https://ingest.neatlogs.com/v1/trace.
+    """Envia um trace único para o endpoint /v1/trace do neatlogs.
 
-    O endpoint /api/data/v2 do SDK 1.1.8 está descontinuado (404 confirmado);
-    o transporte real da plataforma é o POST /v1/trace com um objeto JSON
-    aninhado (children). Uma POST por execução, nunca por span.
+    O destino é configurável por NEATLOGS_ENDPOINT (default
+    https://ingest.neatlogs.com/). O endpoint /api/data/v2 do SDK 1.1.8 está
+    descontinuado (404 confirmado); o transporte real da plataforma é o POST
+    /v1/trace com um objeto JSON aninhado (children). Uma POST por execução,
+    nunca por span.
     """
     api_key = os.getenv("NEATLOGS_API_KEY", "").strip()
     if not api_key:
         logger.warning("NEATLOGS_API_KEY em falta; trace não enviado.")
         return
+
+    base_url = os.getenv(
+        "NEATLOGS_ENDPOINT", "https://ingest.neatlogs.com/"
+    ).rstrip("/")
+    url = f"{base_url}/v1/trace"
 
     children = []
     for step in state.plan:
@@ -590,7 +693,7 @@ def send_trace_v1(state: RunState, target_domain: str) -> None:
 
     try:
         resp = requests.post(
-            "https://ingest.neatlogs.com/v1/trace",
+            url,
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -614,17 +717,74 @@ def send_trace_v1(state: RunState, target_domain: str) -> None:
 
 
 if __name__ == "__main__":
+    import argparse
     import sys
 
-    goal = sys.argv[1] if len(sys.argv) > 1 else (
-        "Detetar disrupções competitivas num domínio alvo usando crescimento de headcount."
+    parser = argparse.ArgumentParser(
+        description="DisruptRadar — agente de inteligência competitiva via headcount."
     )
-    target = sys.argv[2] if len(sys.argv) > 2 else "openai.com"
+    parser.add_argument(
+        "--goal",
+        default=(
+            "Detetar disrupções competitivas num domínio alvo usando crescimento "
+            "de headcount."
+        ),
+        help="objetivo do agente (default: deteção de disrupção por headcount)",
+    )
+    parser.add_argument(
+        "--domain",
+        default="openai.com",
+        help="domínio alvo (default: openai.com)",
+    )
+    parser.add_argument(
+        "--fixture",
+        action="store_true",
+        help="usa dados sintéticos, sem rede (RUN_DEMO_FIXTURE_MODE=true)",
+    )
+    parser.add_argument(
+        "--fault",
+        action="store_true",
+        help="injeta falha simulada na 1.ª tentativa (INJECT_LOCAL_FAULT_SIMULATION=true)",
+    )
+    parser.add_argument(
+        "--resume",
+        type=int,
+        default=None,
+        metavar="RUN_ID",
+        help="restaura artifacts/checkpoint_<RUN_ID>.json e continua de onde parou",
+    )
+    args = parser.parse_args()
+
     try:
-        agent_instance = DisruptRadarAgent(goal=goal, target_domain=target)
+        if args.resume is not None:
+            restored = RunState.load_checkpoint(args.resume)
+            agent_instance = DisruptRadarAgent(
+                goal=restored.goal or args.goal,
+                target_domain=restored.target_domain or args.domain,
+                fixture_mode=True if args.fixture else None,
+                inject_fault=True if args.fault else None,
+                state=restored,
+            )
+            logger.info(
+                "Checkpoint %s restaurado (passo %d/%d).",
+                args.resume,
+                restored.current_step_idx + 1,
+                len(restored.plan) or 1,
+            )
+        else:
+            agent_instance = DisruptRadarAgent(
+                goal=args.goal,
+                target_domain=args.domain,
+                fixture_mode=True if args.fixture else None,
+                inject_fault=True if args.fault else None,
+            )
     except ValueError as exc:
         print(f"Erro: {exc}")
         raise SystemExit(2)
+    except FileNotFoundError:
+        print(f"Checkpoint não encontrado: artifacts/checkpoint_{args.resume}.json")
+        raise SystemExit(2)
+
     final_state = agent_instance.run_agent()
     send_trace_v1(final_state, agent_instance.target_domain)
     print("\n===== RELATÓRIO FINAL =====\n")

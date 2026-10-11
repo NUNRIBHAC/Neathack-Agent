@@ -60,3 +60,41 @@ def test_math_recomputed_exactly_40(agent):
 def test_risk_high_and_verified(agent):
     assert agent.state.risk_level == "HIGH"
     assert agent.state.is_verified is True
+
+
+def test_send_trace_v1_payload(monkeypatch):
+    """Valida o transporte real /v1/trace sem tocar na rede."""
+    monkeypatch.setenv("NEATLOGS_API_KEY", "test-key")
+    monkeypatch.setenv("NEATLOGS_ENDPOINT", "https://ingest.neatlogs.com/")
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"trace_id": "abc", "spans": 6}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        return FakeResponse()
+
+    monkeypatch.setattr(agent_module.requests, "post", fake_post)
+    state = agent_module.RunState("Teste de envio")
+    state.plan = agent_module.DEFAULT_PLAN[:]
+    state.findings = {
+        "current_headcount": 140,
+        "previous_headcount": 100,
+        "growth_pct": 40.0,
+    }
+    state.is_verified = True
+    state.risk_level = "HIGH"
+    state.final_report = "Relatório de teste"
+    agent_module.send_trace_v1(state, "acme.example.com")
+
+    assert captured["url"] == "https://ingest.neatlogs.com/v1/trace"
+    assert captured["json"]["name"] == "disrupt-radar"
+    assert len(captured["json"]["children"]) == 5
+    assert captured["json"]["output"]["risk_level"] == "HIGH"
+    assert captured["json"]["output"]["verified"] is True
