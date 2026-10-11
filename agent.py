@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List
 
@@ -138,9 +139,24 @@ class RunState:
 class DisruptRadarAgent:
     """Agente autónomo de inteligência competitiva com recuperação de falhas."""
 
+    @staticmethod
+    def _validate_domain(domain: str) -> str:
+        """Valida o formato básico de um domínio (ex.: acme.example.com)."""
+        if not isinstance(domain, str):
+            raise ValueError(f"target_domain inválido: {domain!r}")
+        candidate = domain.strip().lower()
+        if len(candidate) > 253:
+            raise ValueError(f"target_domain demasiado longo: {domain!r}")
+        hostname_re = re.compile(
+            r"^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))+$"
+        )
+        if not hostname_re.match(candidate):
+            raise ValueError(f"target_domain com formato inválido: {domain!r}")
+        return candidate
+
     def __init__(self, goal: str, target_domain: str, max_retries: int = 3) -> None:
         self.goal = goal
-        self.target_domain = target_domain
+        self.target_domain = self._validate_domain(target_domain)
         self.max_retries = max_retries
 
         self.fixture_mode = (
@@ -269,12 +285,24 @@ class DisruptRadarAgent:
             return True
 
         # Modo live: Crustdata API (token via header Authorization).
+        api_key = os.getenv("CRUSTDATA_API_KEY", "").strip()
+        if not api_key:
+            self.state.errors_log.append(
+                {
+                    "step": "FETCH_DATA",
+                    "attempt": attempts,
+                    "error": "CRUSTDATA_API_KEY em falta no modo live.",
+                }
+            )
+            logger.error("CRUSTDATA_API_KEY em falta; a abortar fetch live.")
+            return False
+
         url = (
             f"{os.getenv('CRUSTDATA_API_URL', 'https://api.crustdata.com')}"
             "/company/growth_metrics"
         )
         headers = {
-            "Authorization": f"Token {os.getenv('CRUSTDATA_API_KEY', '')}",
+            "Authorization": f"Token {api_key}",
             "Content-Type": "application/json",
         }
         payload = {"company_domain": self.target_domain}
@@ -301,6 +329,21 @@ class DisruptRadarAgent:
             growth_pct = nested.get("growth_percentage", nested.get("growth_pct"))
 
         # Matemática reversa: se a API devolver apenas a % e um dos lados.
+        if growth_pct is not None and growth_pct <= -100.0:
+            self.state.errors_log.append(
+                {
+                    "step": "FETCH_DATA",
+                    "attempt": attempts,
+                    "error": (
+                        "Crescimento impossível (growth_pct <= -100.0); "
+                        "headcount não pode ser zero/negativo."
+                    ),
+                }
+            )
+            logger.error(
+                "Crescimento impossível recebido da API (%.1f%%).", growth_pct
+            )
+            return False
         if growth_pct is not None and previous is None and current is not None:
             previous = current / (1.0 + growth_pct / 100.0)
         if growth_pct is not None and current is None and previous is not None:
@@ -497,7 +540,11 @@ if __name__ == "__main__":
         "Detetar disrupções competitivas num domínio alvo usando crescimento de headcount."
     )
     target = sys.argv[2] if len(sys.argv) > 2 else "openai.com"
-    agent_instance = DisruptRadarAgent(goal=goal, target_domain=target)
+    try:
+        agent_instance = DisruptRadarAgent(goal=goal, target_domain=target)
+    except ValueError as exc:
+        print(f"Erro: {exc}")
+        raise SystemExit(2)
     final_state = agent_instance.run_agent()
     print("\n===== RELATÓRIO FINAL =====\n")
     print(final_state.final_report)
