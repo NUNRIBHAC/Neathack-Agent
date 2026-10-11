@@ -1,0 +1,3533 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+func TestWorkspaceWatchFansOverMembersWithSharedBudget(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	repoA, repoAKey := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "a.go", "package x\n")
+	repoB, repoBKey := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "b.go", "package x\n")
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "ws",
+		Repos: []workspaceRepo{
+			{RepoKey: repoAKey, LocalPathHint: repoA},
+			{RepoKey: repoBKey, LocalPathHint: repoB},
+			{RepoKey: "gh/example/repoc", LocalPathHint: "/nonexistent/repoc-xyz"}, // unresolvable -> skipped
+		},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	var ticked []string
+	var seen []int
+	repoTick := func(repoDir string, agentCalls *int) {
+		ticked = append(ticked, repoDir)
+		seen = append(seen, *agentCalls)
+		*agentCalls++ // simulate a token-spending step to prove the counter is shared, not per-repo
+	}
+	w := defaultWatchOptions()
+	w.once = true
+	opts := Options{Version: "test", Env: env, Runner: runner, Now: time.Now}
+	out := &bytes.Buffer{}
+	agentCalls := 0
+	if err := workspaceWatchLoop(context.Background(), out, opts, w, "ws", &agentCalls, repoTick); err != nil {
+		t.Fatalf("workspaceWatchLoop: %v", err)
+	}
+	// repoc is unresolvable, so only the two resolvable members tick.
+	if len(ticked) != 2 {
+		t.Fatalf("expected two members ticked (repoc skipped), got %v", ticked)
+	}
+	// The --budget counter is SHARED across members: the second member sees the first's increment.
+	if len(seen) != 2 || seen[0] != 0 || seen[1] != 1 {
+		t.Fatalf("agentCalls must be shared across members (not reset per repo), saw %v", seen)
+	}
+	o := out.String()
+	if !strings.Contains(o, repoAKey) || !strings.Contains(o, repoBKey) {
+		t.Fatalf("both resolvable repo keys should be reported:\n%s", o)
+	}
+	if !strings.Contains(o, "gh/example/repoc") || !strings.Contains(o, "skipped") {
+		t.Fatalf("unresolvable member must be reported as skipped:\n%s", o)
+	}
+}
+
+func TestWorkspaceWatchMemoryQueuesStayIsolatedAcrossRepoCopies(t *testing.T) {
+	parent := t.TempDir()
+	repoA := filepath.Join(parent, "repo-a")
+	repoB := filepath.Join(parent, "repo-b")
+	if err := os.MkdirAll(repoA, 0o700); err != nil {
+		t.Fatalf("mkdir repo A: %v", err)
+	}
+	if err := os.MkdirAll(repoB, 0o700); err != nil {
+		t.Fatalf("mkdir repo B: %v", err)
+	}
+	aliasA := filepath.Join(parent, "repo-a-alias")
+	if err := os.Symlink(repoA, aliasA); err != nil {
+		t.Skipf("directory symlinks are unavailable on this platform: %v", err)
+	}
+	env := EntireEnv{
+		RepoRoot:        aliasA,
+		PluginConfigDir: t.TempDir(),
+		PluginDataDir:   t.TempDir(),
+		PluginStateDir:  t.TempDir(),
+		PluginCacheDir:  t.TempDir(),
+	}
+	opts := Options{Version: "test", Env: env, Now: func() time.Time {
+		return time.Date(2026, 8, 9, 15, 0, 0, 0, time.UTC)
+	}}
+
+	storageA, err := repoStoragePaths(context.Background(), nil, env, aliasA)
+	if err != nil {
+		t.Fatalf("repo A storage: %v", err)
+	}
+	storageB, err := repoStoragePaths(context.Background(), nil, env, repoB)
+	if err != nil {
+		t.Fatalf("repo B storage: %v", err)
+	}
+	if storageA.Key == storageB.Key || storageA.BrainDir == storageB.BrainDir || storageA.HeadPath == storageB.HeadPath {
+		t.Fatalf("workspace repos share storage: A=%+v B=%+v", storageA, storageB)
+	}
+	writeQueueManifest := func(storage repoStorage, sessionID string) {
+		t.Helper()
+		manifest := exportManifest{
+			SchemaVersion: brainManifestSchemaVersion,
+			RepoKey:       storage.Key,
+			Sources: &brainSources{Sessions: &sessionSourceManifest{
+				DefaultBranch: "main",
+				Sessions: []exportSession{{
+					SessionID:      sessionID,
+					Branch:         "main",
+					TranscriptPath: filepath.ToSlash(filepath.Join("sessions", "main", sessionID+".jsonl")),
+				}},
+			}},
+		}
+		if err := writeBrainManifestAndReadme(storage.BrainDir, manifest); err != nil {
+			t.Fatalf("write %s manifest: %v", sessionID, err)
+		}
+	}
+	writeQueueManifest(storageA, "session-a")
+	writeQueueManifest(storageB, "session-b")
+
+	oldLaunch := memoryWorkerLaunch
+	defer func() { memoryWorkerLaunch = oldLaunch }()
+	var launched []string
+	memoryWorkerLaunch = func(repoDir string) error {
+		launched = append(launched, repoDir)
+		return nil
+	}
+	cmd := &cobra.Command{}
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	w := defaultWatchOptions()
+	for _, repoDir := range []string{aliasA, repoB} {
+		steps := watchStepsForRepo(cmd, opts, w, repoDir, opts.Now)
+		if err := steps.reconcile(context.Background()); err != nil {
+			t.Fatalf("reconcile %s: %v", repoDir, err)
+		}
+	}
+	if len(launched) != 2 || launched[0] != aliasA || launched[1] != repoB {
+		t.Fatalf("worker launches = %v, want [%s %s]", launched, aliasA, repoB)
+	}
+
+	for _, check := range []struct {
+		storage   repoStorage
+		sessionID string
+	}{
+		{storage: storageA, sessionID: "session-a"},
+		{storage: storageB, sessionID: "session-b"},
+	} {
+		jobs, issues := loadMemoryJobsChecked(check.storage.BrainDir)
+		if len(issues) != 0 || len(jobs) == 0 {
+			t.Fatalf("queue %s jobs=%+v issues=%+v", check.storage.Key, jobs, issues)
+		}
+		for _, job := range jobs {
+			if job.RepoKey != check.storage.Key || job.SessionID != check.sessionID {
+				t.Fatalf("cross-repo queue contamination in %s: %+v", check.storage.BrainDir, job)
+			}
+		}
+	}
+}
+
+func TestWorkspaceWatchOnceSkipsStaleLocalPathHintBeforeTick(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	repoB := t.TempDir()
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{
+		fakeCommandKey("git", "remote", "get-url", "origin"): {stdout: "git@github.com:example/repob.git\n"},
+	}}
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "ws",
+		Repos: []workspaceRepo{
+			{RepoKey: "gh/example/repoa", LocalPathHint: repoB},
+		},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	w := defaultWatchOptions()
+	w.once = true
+	opts := Options{Version: "test", Env: env, Runner: runner, Now: time.Now}
+	out := &bytes.Buffer{}
+	agentCalls := 0
+	if err := workspaceWatchLoop(context.Background(), out, opts, w, "ws", &agentCalls, func(repoDir string, agentCalls *int) {
+		t.Fatalf("repoTick must not run for stale hint %s", repoDir)
+	}); err != nil {
+		t.Fatalf("workspaceWatchLoop: %v", err)
+	}
+	o := out.String()
+	if !strings.Contains(o, "skipped (unsafe: local_path_hint repo_key mismatch: gh/example/repob)") {
+		t.Fatalf("stale hint should be reported as an unsafe skip:\n%s", o)
+	}
+}
+
+func TestWorkspaceWatchRejectsInvalidJobsBeforeWork(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	cmd := NewRootCommand(Options{Version: "test", Env: env, Runner: &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}, Now: time.Now})
+	_, err := execute(t, cmd, "workspace", "watch", "ws", "--once", "--jobs", "0")
+	if err == nil || !strings.Contains(err.Error(), "--jobs must be greater than 0") {
+		t.Fatalf("expected invalid jobs error, got %v", err)
+	}
+}
+
+func TestWorkspaceCreateAddRefreshAndContext(t *testing.T) {
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+
+	if _, err := execute(t, cmd, "refresh", "index", "--graph-binary", "entire"); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	out, err := execute(t, cmd, "workspace", "create", "payments-platform")
+	if err != nil {
+		t.Fatalf("workspace create: %v", err)
+	}
+	if !strings.Contains(out, filepath.Join(workspaceDirName, "payments-platform")) {
+		t.Fatalf("create output = %q", out)
+	}
+	if strings.Contains(out, filepath.Join(repoStoreDirName, workspaceDirName)) {
+		t.Fatalf("workspace must live beside repos/, not inside it: %q", out)
+	}
+	if _, err := execute(t, cmd, "workspace", "add", "payments-platform", repoDir, "--name", "api"); err != nil {
+		t.Fatalf("workspace add: %v", err)
+	}
+	refreshOut, err := execute(t, cmd, "workspace", "refresh", "payments-platform")
+	if err != nil {
+		t.Fatalf("workspace refresh: %v", err)
+	}
+	if !strings.Contains(refreshOut, "gh/example/repo ok") {
+		t.Fatalf("refresh output = %q", refreshOut)
+	}
+	contextOut, err := execute(t, cmd, "workspace", "inspect", "context", "payments-platform", "ValidateToken", "--json")
+	if err != nil {
+		t.Fatalf("workspace context: %v", err)
+	}
+	if !strings.Contains(contextOut, `"repo_key": "gh/example/repo"`) || !strings.Contains(contextOut, `"ValidateToken"`) {
+		t.Fatalf("context output missing workspace symbol:\n%s", contextOut)
+	}
+	if !strings.Contains(contextOut, `"contract_state": "ok"`) {
+		t.Fatalf("context output missing contract freshness:\n%s", contextOut)
+	}
+	impactOut, err := execute(t, cmd, "workspace", "inspect", "impact", "payments-platform", "ValidateToken", "--json")
+	if err != nil {
+		t.Fatalf("workspace impact: %v", err)
+	}
+	if !strings.Contains(impactOut, `"relations"`) || !strings.Contains(impactOut, `"ValidateToken"`) {
+		t.Fatalf("impact output missing workspace facts:\n%s", impactOut)
+	}
+}
+
+func TestWorkspaceRefreshReportsRepoSemanticFreshness(t *testing.T) {
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	if _, err := execute(t, cmd, "refresh", "index", "--graph-binary", "entire"); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	manifest := mustSemanticSource(t, env)
+	storePath := filepath.Join(env.PluginDataDir, repoStoreDirName, "gh", "example", "repo", filepath.FromSlash(manifest.StorePath))
+	if err := os.Remove(storePath); err != nil {
+		t.Fatalf("remove store: %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err != nil {
+		t.Fatalf("workspace create: %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "add", "payments-platform", repoDir, "--name", "api"); err != nil {
+		t.Fatalf("workspace add: %v", err)
+	}
+	out, err := execute(t, cmd, "workspace", "refresh", "payments-platform")
+	if err != nil {
+		t.Fatalf("workspace refresh: %v", err)
+	}
+	if !strings.Contains(out, "gh/example/repo unsafe") {
+		t.Fatalf("refresh output = %q", out)
+	}
+	contextOut, err := execute(t, cmd, "workspace", "inspect", "context", "payments-platform", "ValidateToken", "--json")
+	if err != nil {
+		t.Fatalf("workspace context: %v", err)
+	}
+	if !strings.Contains(contextOut, `"state": "unsafe"`) {
+		t.Fatalf("context output missing freshness:\n%s", contextOut)
+	}
+}
+
+func TestWorkspaceContextAndImpactReportLockedSemanticIndex(t *testing.T) {
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	if _, err := execute(t, cmd, "refresh", "index", "--graph-binary", "entire"); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err != nil {
+		t.Fatalf("workspace create: %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "add", "payments-platform", repoDir, "--name", "api"); err != nil {
+		t.Fatalf("workspace add: %v", err)
+	}
+	brainDir := filepath.Join(env.PluginDataDir, repoStoreDirName, "gh", "example", "repo")
+	unlock, err := acquireSemanticIndexLock(brainDir)
+	if err != nil {
+		t.Fatalf("acquire lock: %v", err)
+	}
+	defer unlock()
+
+	contextOut, err := execute(t, cmd, "workspace", "inspect", "context", "payments-platform", "ValidateToken", "--json")
+	if err != nil {
+		t.Fatalf("workspace context: %v", err)
+	}
+	if !strings.Contains(contextOut, `"error": "index_locked:`) {
+		t.Fatalf("context output missing lock error:\n%s", contextOut)
+	}
+	impactOut, err := execute(t, cmd, "workspace", "inspect", "impact", "payments-platform", "ValidateToken", "--json")
+	if err != nil {
+		t.Fatalf("workspace impact: %v", err)
+	}
+	if !strings.Contains(impactOut, `"error": "index_locked:`) {
+		t.Fatalf("impact output missing lock error:\n%s", impactOut)
+	}
+}
+
+func TestWorkspaceRefreshRejectsMismatchedLocalPathHintRepoKey(t *testing.T) {
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	if _, err := execute(t, cmd, "refresh", "index", "--graph-binary", "entire"); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "payments-platform",
+		Repos:         []workspaceRepo{{RepoKey: "gh/example/repo", Name: "api", LocalPathHint: repoDir}},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+	runner.responses[fakeCommandKey("git", "remote", "get-url", "origin")] = fakeCommandResponse{stdout: "git@github.com:other/repo.git\n"}
+	out, err := execute(t, cmd, "workspace", "refresh", "payments-platform")
+	if err != nil {
+		t.Fatalf("workspace refresh: %v", err)
+	}
+	if !strings.Contains(out, "gh/example/repo unsafe") {
+		t.Fatalf("refresh output = %q", out)
+	}
+}
+
+func TestWorkspaceStoresRepoKeyAndLocalPathHint(t *testing.T) {
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err != nil {
+		t.Fatalf("workspace create: %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "add", "payments-platform", repoDir, "--name", "api"); err != nil {
+		t.Fatalf("workspace add: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(env.PluginDataDir, workspaceDirName, "payments-platform", workspaceManifestName))
+	if err != nil {
+		t.Fatalf("read workspace: %v", err)
+	}
+	var manifest workspaceManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("parse workspace: %v", err)
+	}
+	if len(manifest.Repos) != 1 || manifest.Repos[0].RepoKey != "gh/example/repo" || manifest.Repos[0].LocalPathHint != repoDir {
+		t.Fatalf("workspace repos = %+v", manifest.Repos)
+	}
+}
+
+func TestWorkspaceAddStoresResolvedRepoRootForRelativeHint(t *testing.T) {
+	parent := t.TempDir()
+	repoDir := filepath.Join(parent, "api")
+	if err := os.MkdirAll(repoDir, 0o700); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	otherDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	if _, err := execute(t, cmd, "refresh", "index", "--graph-binary", "entire"); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err != nil {
+		t.Fatalf("workspace create: %v", err)
+	}
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(parent); err != nil {
+		t.Fatalf("chdir parent: %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "add", "payments-platform", "api", "--name", "api"); err != nil {
+		_ = os.Chdir(oldWD)
+		t.Fatalf("workspace add: %v", err)
+	}
+	if err := os.Chdir(otherDir); err != nil {
+		_ = os.Chdir(oldWD)
+		t.Fatalf("chdir other: %v", err)
+	}
+	defer func() { _ = os.Chdir(oldWD) }()
+	out, err := execute(t, cmd, "workspace", "refresh", "payments-platform")
+	if err != nil {
+		t.Fatalf("workspace refresh: %v", err)
+	}
+	if !strings.Contains(out, "gh/example/repo ok") {
+		t.Fatalf("refresh output = %q", out)
+	}
+	manifest, err := loadWorkspaceManifest(env, "payments-platform")
+	if err != nil {
+		t.Fatalf("load workspace: %v", err)
+	}
+	if manifest.Repos[0].LocalPathHint != repoDir {
+		t.Fatalf("local path hint = %q, want %q", manifest.Repos[0].LocalPathHint, repoDir)
+	}
+}
+
+func TestWorkspaceCreateDoesNotOverwriteExistingWorkspace(t *testing.T) {
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err != nil {
+		t.Fatalf("workspace create: %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "add", "payments-platform", repoDir, "--name", "api"); err != nil {
+		t.Fatalf("workspace add: %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err == nil {
+		t.Fatalf("workspace create overwrote existing workspace")
+	}
+	manifest, err := loadWorkspaceManifest(env, "payments-platform")
+	if err != nil {
+		t.Fatalf("load workspace: %v", err)
+	}
+	if len(manifest.Repos) != 1 || manifest.Repos[0].Name != "api" {
+		t.Fatalf("workspace repos were not preserved: %+v", manifest.Repos)
+	}
+}
+
+func TestWorkspacePropagatesPluginDirErrors(t *testing.T) {
+	env := EntireEnv{PluginDataDir: "relative-data"}
+	if _, err := loadWorkspaceManifest(env, "payments-platform"); err == nil || !strings.Contains(err.Error(), envPluginDataDir) {
+		t.Fatalf("load workspace err = %v", err)
+	}
+}
+
+func TestWorkspaceRejectsDotNamesBeforePathResolution(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}, Now: time.Now})
+	for _, name := range []string{".", "..", "..."} {
+		if _, err := execute(t, cmd, "workspace", "create", name); err == nil {
+			t.Fatalf("workspace create accepted %q", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(env.PluginDataDir, repoStoreDirName, exportManifestFileName)); !os.IsNotExist(err) {
+		t.Fatalf("dot workspace wrote outside workspaces: %v", err)
+	}
+}
+
+func TestWorkspaceRejectsUnsafeRepoKey(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	dir, err := workspaceDir(env, "payments-platform")
+	if err != nil {
+		t.Fatalf("workspace dir: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	data := []byte(`{"schema_version":1,"name":"payments-platform","repos":[{"repo_key":"../../outside","name":"bad"}]}` + "\n")
+	if err := os.WriteFile(filepath.Join(dir, workspaceManifestName), data, 0o600); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+	if _, err := loadWorkspaceManifest(env, "payments-platform"); err == nil || !strings.Contains(err.Error(), "repo_key") {
+		t.Fatalf("load workspace err = %v", err)
+	}
+}
+
+func TestWorkspaceRejectsDotRepoKeys(t *testing.T) {
+	for _, key := range []string{".", "..", "gh/../repo", "gh//repo"} {
+		if err := validateWorkspaceRepoKey(key); err == nil {
+			t.Fatalf("repo key accepted: %q", key)
+		}
+	}
+}
+
+func TestWorkspaceRejectsSymlinkedWorkspacePath(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	workspacesRoot := filepath.Join(env.PluginDataDir, workspaceDirName)
+	if err := os.MkdirAll(workspacesRoot, 0o700); err != nil {
+		t.Fatalf("mkdir workspaces: %v", err)
+	}
+	target := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(workspacesRoot, "payments-platform")); err != nil {
+		t.Fatalf("symlink workspace: %v", err)
+	}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}, Now: time.Now})
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("workspace create err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, workspaceManifestName)); !os.IsNotExist(err) {
+		t.Fatalf("workspace manifest written through symlink: %v", err)
+	}
+}
+
+func TestWorkspaceCreateIgnoresSymlinkedLegacyTree(t *testing.T) {
+	// Workspaces live beside repos/, so a symlinked repos root no longer
+	// blocks workspace create — but the legacy-migration path must refuse to
+	// read through it, and nothing may be written behind the symlink.
+	env := semanticTestEnv(t, t.TempDir())
+	brainRoot := filepath.Join(env.PluginDataDir, repoStoreDirName)
+	external := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(external, workspaceDirName, "payments-platform"), 0o700); err != nil {
+		t.Fatalf("seed external legacy tree: %v", err)
+	}
+	if err := os.Symlink(external, brainRoot); err != nil {
+		t.Fatalf("symlink brain root: %v", err)
+	}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}, Now: time.Now})
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err != nil {
+		t.Fatalf("workspace create: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(env.PluginDataDir, workspaceDirName, "payments-platform", workspaceManifestName)); err != nil {
+		t.Fatalf("workspace not created at its new home: %v", err)
+	}
+	// The symlinked legacy entry was neither migrated nor written through.
+	if _, err := os.Stat(filepath.Join(external, workspaceDirName, "payments-platform", workspaceManifestName)); !os.IsNotExist(err) {
+		t.Fatalf("write leaked through symlinked legacy tree: %v", err)
+	}
+}
+
+func TestWorkspaceLegacyDirMigratesOnTouch(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	// A pre-relocation workspace at repos/workspaces/<name> with a valid manifest.
+	legacy := filepath.Join(env.PluginDataDir, repoStoreDirName, workspaceDirName, "payments-platform")
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := workspaceManifest{SchemaVersion: workspaceSchemaVersion, Name: "payments-platform", Repos: []workspaceRepo{{RepoKey: "gh/acme/api"}}}
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, workspaceManifestName), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadWorkspaceManifest(env, "payments-platform")
+	if err != nil {
+		t.Fatalf("legacy workspace must load (and migrate): %v", err)
+	}
+	if len(loaded.Repos) != 1 || loaded.Repos[0].RepoKey != "gh/acme/api" {
+		t.Fatalf("migrated manifest content wrong: %+v", loaded)
+	}
+	if _, err := os.Stat(filepath.Join(env.PluginDataDir, workspaceDirName, "payments-platform", workspaceManifestName)); err != nil {
+		t.Fatalf("manifest not at the new home after migration: %v", err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy dir should be gone after migration: %v", err)
+	}
+}
+
+func TestBrainDirForKeyReservesWorkspacesSegment(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	if _, err := brainDirForKey(env, "workspaces/acme/api"); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("workspaces/ must be reserved in the repo keyspace, got %v", err)
+	}
+	if _, err := brainDirForKey(env, "gh/acme/api"); err != nil {
+		t.Fatalf("ordinary key must resolve: %v", err)
+	}
+}
+
+func TestWorkspaceGraphReportsPerRepoTrust(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	opts := Options{Version: "test", Env: env, Runner: runner, Now: func() time.Time { return time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC) }}
+	cmd := &cobra.Command{Use: "index"}
+
+	repoA := t.TempDir()
+	keyA := testLocalRepoStorageKey(t, repoA)
+	indexWorkspaceGraphRepo(t, cmd, opts, runner, repoA, keyA, "HandleA")
+
+	// Pin a degraded completeness/trust on the repo's semantic manifest so the
+	// workspace graph result is asserted to carry per-repo trust diagnostics.
+	brainDirA := filepath.Join(env.PluginDataDir, repoStoreDirName, filepath.FromSlash(keyA))
+	manifestA, err := loadBrainManifest(brainDirA)
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	manifestA.Sources.Semantic.CompletenessLevel = "degraded"
+	manifestA.Sources.Semantic.Trust = "partial"
+	manifestA.Sources.Semantic.LanguageTiers = map[string]string{"Go": "semantic"}
+	if err := writeBrainManifestAndReadme(brainDirA, *manifestA); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "graph",
+		Repos:         []workspaceRepo{{RepoKey: keyA, LocalPathHint: repoA}},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	var out bytes.Buffer
+	graphCmd := &cobra.Command{Use: "graph"}
+	graphCmd.SetOut(&out)
+	if err := runWorkspaceGraph(graphCmd, opts, workspaceGraphOptions{limit: 10, json: true}, "graph"); err != nil {
+		t.Fatalf("workspace graph: %v", err)
+	}
+	if !strings.Contains(out.String(), `"completeness_level": "degraded"`) || !strings.Contains(out.String(), `"trust": "partial"`) {
+		t.Fatalf("workspace graph missing per-repo trust diagnostics:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), `"language_tiers"`) || !strings.Contains(out.String(), `"Go": "semantic"`) {
+		t.Fatalf("workspace graph missing per-repo language_tiers:\n%s", out.String())
+	}
+}
+
+func TestWorkspaceGraphReportsSharedExternalContracts(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	opts := Options{Version: "test", Env: env, Runner: runner, Now: func() time.Time { return time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC) }}
+	cmd := &cobra.Command{Use: "index"}
+
+	repoA := t.TempDir()
+	keyA := testLocalRepoStorageKey(t, repoA)
+	indexWorkspaceGraphRepo(t, cmd, opts, runner, repoA, keyA, "HandleSharedA")
+	repoB := t.TempDir()
+	keyB := testLocalRepoStorageKey(t, repoB)
+	indexWorkspaceGraphRepo(t, cmd, opts, runner, repoB, keyB, "HandleSharedB")
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "graph",
+		Repos: []workspaceRepo{
+			{RepoKey: keyA, LocalPathHint: repoA},
+			{RepoKey: keyB, LocalPathHint: repoB},
+		},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	var out bytes.Buffer
+	graphCmd := &cobra.Command{Use: "graph"}
+	graphCmd.SetOut(&out)
+	if err := runWorkspaceGraph(graphCmd, opts, workspaceGraphOptions{limit: 10, json: true}, "graph"); err != nil {
+		t.Fatalf("workspace graph: %v", err)
+	}
+	if !strings.Contains(out.String(), `"contracts"`) || !strings.Contains(out.String(), `external:route:/shared`) {
+		t.Fatalf("workspace graph missing shared external contract:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), `"cross_edges"`) ||
+		!strings.Contains(out.String(), `"relation_kind": "shared_external_contract"`) ||
+		!strings.Contains(out.String(), `external:config:kubernetes/image/shared:latest`) {
+		t.Fatalf("workspace graph missing cross-repo symbol/resource edges:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), `"metrics"`) || !strings.Contains(out.String(), `"relation_types"`) {
+		t.Fatalf("workspace graph missing per-repo graph metadata:\n%s", out.String())
+	}
+	artifactPath := filepath.Join(env.PluginDataDir, workspaceDirName, "graph", workspaceGraphName)
+	artifact, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatalf("read workspace graph artifact: %v", err)
+	}
+	if !strings.Contains(string(artifact), `"contracts"`) || !strings.Contains(string(artifact), `external:route:/shared`) {
+		t.Fatalf("workspace graph artifact missing contract:\n%s", artifact)
+	}
+	if !strings.Contains(string(artifact), `"cross_edges"`) || !strings.Contains(string(artifact), `external:config:kubernetes/image/shared:latest`) {
+		t.Fatalf("workspace graph artifact missing cross-repo edges:\n%s", artifact)
+	}
+}
+
+func TestWorkspaceGraphReportsCrossRepoImportCandidates(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	opts := Options{Version: "test", Env: env, Runner: runner, Now: func() time.Time { return time.Date(2026, 6, 20, 13, 0, 0, 0, time.UTC) }}
+	cmd := &cobra.Command{Use: "index"}
+
+	repoA := t.TempDir()
+	keyA := testLocalRepoStorageKey(t, repoA)
+	repoB := t.TempDir()
+	keyB := testLocalRepoStorageKey(t, repoB)
+	indexWorkspaceGraphRepoWithSnapshot(t, cmd, opts, runner, repoA, keyA, workspaceGraphImportingSnapshot(keyA, "HandleAPI", keyB+"/pkg"))
+	indexWorkspaceGraphRepoWithSnapshot(t, cmd, opts, runner, repoB, keyB, workspaceGraphLibrarySnapshot(keyB, "pkg/service.go", "Service"))
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "imports",
+		Repos: []workspaceRepo{
+			{RepoKey: keyA, LocalPathHint: repoA},
+			{RepoKey: keyB, LocalPathHint: repoB},
+		},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	var out bytes.Buffer
+	graphCmd := &cobra.Command{Use: "graph"}
+	graphCmd.SetOut(&out)
+	if err := runWorkspaceGraph(graphCmd, opts, workspaceGraphOptions{limit: 10, json: true}, "imports"); err != nil {
+		t.Fatalf("workspace graph: %v", err)
+	}
+	for _, want := range []string{
+		`"relation_kind": "cross_repo_import_candidate"`,
+		`external:import:` + keyB + `/pkg`,
+		`"from_repo": "` + keyA + `"`,
+		`"to_repo": "` + keyB + `"`,
+		`pkg/service.go`,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("workspace graph import edge missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestWorkspaceGraphMatchesScopedPackageImportCandidates(t *testing.T) {
+	edges := workspaceGraphImportCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			Imports: []workspaceGraphImportRef{{
+				Spec: "@acme/lib/pkg",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "HandleAPI",
+					QualifiedName: "service.HandleAPI",
+					FilePath:      "service.go",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "gh/acme/lib",
+			Candidates: []workspaceGraphSymbolRef{{
+				RepoKey:       "gh/acme/lib",
+				ID:            "lib:sym",
+				Kind:          "function",
+				Name:          "Service",
+				QualifiedName: "pkg.Service",
+				FilePath:      "pkg/service.go",
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("scoped package import edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_import_candidate" || edge.Endpoint != "external:import:@acme/lib/pkg" || edge.FromRepo != "local/app" || edge.ToRepo != "gh/acme/lib" || edge.ToSymbol.FilePath != "pkg/service.go" {
+		t.Fatalf("unexpected scoped package import edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesPackageRepoImportCandidates(t *testing.T) {
+	edges := workspaceGraphImportCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			Imports: []workspaceGraphImportRef{{
+				Spec: "@acme/lib/pkg",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "HandleAPI",
+					QualifiedName: "service.HandleAPI",
+					FilePath:      "service.go",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "npm/@acme/lib",
+			Candidates: []workspaceGraphSymbolRef{{
+				RepoKey:       "npm/@acme/lib",
+				ID:            "lib:sym",
+				Kind:          "function",
+				Name:          "Service",
+				QualifiedName: "pkg.Service",
+				FilePath:      "pkg/service.ts",
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("package repo import edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_import_candidate" || edge.Endpoint != "external:import:@acme/lib/pkg" || edge.FromRepo != "local/app" || edge.ToRepo != "npm/@acme/lib" || edge.ToSymbol.FilePath != "pkg/service.ts" {
+		t.Fatalf("unexpected package repo import edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesGoModuleImportCandidates(t *testing.T) {
+	edges := workspaceGraphImportCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			Imports: []workspaceGraphImportRef{{
+				Spec: "golang.org/x/sync/errgroup",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "Run",
+					QualifiedName: "service.Run",
+					FilePath:      "service.go",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "gomod/golang.org/x/sync",
+			Candidates: []workspaceGraphSymbolRef{{
+				RepoKey:       "gomod/golang.org/x/sync",
+				ID:            "lib:sym",
+				Kind:          "function",
+				Name:          "WithContext",
+				QualifiedName: "errgroup.WithContext",
+				FilePath:      "errgroup/errgroup.go",
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("go module import edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_import_candidate" || edge.Endpoint != "external:import:golang.org/x/sync/errgroup" || edge.FromRepo != "local/app" || edge.ToRepo != "gomod/golang.org/x/sync" || edge.ToSymbol.FilePath != "errgroup/errgroup.go" {
+		t.Fatalf("unexpected go module import edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesVersionedGoModuleImportCandidates(t *testing.T) {
+	edges := workspaceGraphImportCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			Imports: []workspaceGraphImportRef{{
+				Spec: "github.com/acme/lib/v2/pkg",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "Run",
+					QualifiedName: "service.Run",
+					FilePath:      "service.go",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "gh/acme/lib",
+			Candidates: []workspaceGraphSymbolRef{
+				{
+					RepoKey:       "gh/acme/lib",
+					ID:            "root:file",
+					Kind:          "file",
+					Name:          "root",
+					QualifiedName: "root",
+					FilePath:      "cmd/root.go",
+				},
+				{
+					RepoKey:       "gh/acme/lib",
+					ID:            "pkg:file",
+					Kind:          "file",
+					Name:          "service",
+					QualifiedName: "service",
+					FilePath:      "pkg/service.go",
+				},
+			},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("versioned go module import edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_import_candidate" ||
+		edge.Endpoint != "external:import:github.com/acme/lib/v2/pkg" ||
+		edge.FromRepo != "local/app" ||
+		edge.ToRepo != "gh/acme/lib" ||
+		edge.ToSymbol.ID != "pkg:file" ||
+		edge.ToSymbol.Direction != "import_path_target" {
+		t.Fatalf("unexpected versioned go module import edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesCargoImportCandidates(t *testing.T) {
+	edges := workspaceGraphImportCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			Imports: []workspaceGraphImportRef{{
+				Spec: "tokio::sync",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "run",
+					QualifiedName: "app.run",
+					FilePath:      "src/main.rs",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "cargo/tokio",
+			Candidates: []workspaceGraphSymbolRef{{
+				RepoKey:       "cargo/tokio",
+				ID:            "lib:sym",
+				Kind:          "function",
+				Name:          "channel",
+				QualifiedName: "sync.channel",
+				FilePath:      "sync/channel.rs",
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("cargo import edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_import_candidate" || edge.Endpoint != "external:import:tokio::sync" || edge.FromRepo != "local/app" || edge.ToRepo != "cargo/tokio" || edge.ToSymbol.FilePath != "sync/channel.rs" {
+		t.Fatalf("unexpected cargo import edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesMavenImportCandidates(t *testing.T) {
+	edges := workspaceGraphImportCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			Imports: []workspaceGraphImportRef{{
+				Spec: "com.acme.lib.Service",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "run",
+					QualifiedName: "service.run",
+					FilePath:      "src/main/java/com/acme/app/App.java",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "maven/com.acme/lib",
+			Candidates: []workspaceGraphSymbolRef{{
+				RepoKey:       "maven/com.acme/lib",
+				ID:            "lib:sym",
+				Kind:          "class",
+				Name:          "Service",
+				QualifiedName: "Service",
+				FilePath:      "Service.java",
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("maven import edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_import_candidate" || edge.Endpoint != "external:import:com.acme.lib.Service" || edge.FromRepo != "local/app" || edge.ToRepo != "maven/com.acme/lib" || edge.ToSymbol.FilePath != "Service.java" {
+		t.Fatalf("unexpected maven import edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesAdditionalPackageImportCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		spec          string
+		repoKey       string
+		targetName    string
+		qualifiedName string
+		filePath      string
+	}{
+		{
+			name:          "nuget",
+			spec:          "Newtonsoft.Json.Linq",
+			repoKey:       "nuget/Newtonsoft.Json",
+			targetName:    "Linq",
+			qualifiedName: "Linq",
+			filePath:      "Linq/JToken.cs",
+		},
+		{
+			name:          "gem",
+			spec:          "active_support/core_ext",
+			repoKey:       "gem/active_support",
+			targetName:    "core_ext",
+			qualifiedName: "core_ext",
+			filePath:      "lib/active_support/core_ext.rb",
+		},
+		{
+			name:          "composer",
+			spec:          "monolog/monolog/src/Logger",
+			repoKey:       "composer/monolog/monolog",
+			targetName:    "Logger",
+			qualifiedName: "src/Logger",
+			filePath:      "src/Logger.php",
+		},
+		{
+			name:          "pypi hyphen underscore alias",
+			spec:          "acme_client.transport",
+			repoKey:       "pypi/acme-client",
+			targetName:    "transport",
+			qualifiedName: "transport",
+			filePath:      "acme_client/transport.py",
+		},
+		{
+			name:          "cargo hyphen underscore alias",
+			spec:          "tokio_util::codec",
+			repoKey:       "cargo/tokio-util",
+			targetName:    "codec",
+			qualifiedName: "codec",
+			filePath:      "src/codec/framed.rs",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edges := workspaceGraphImportCrossEdges([]workspaceRepoGraphIndex{
+				{
+					RepoKey: "local/app",
+					Imports: []workspaceGraphImportRef{{
+						Spec: tc.spec,
+						Source: workspaceGraphSymbolRef{
+							RepoKey:       "local/app",
+							ID:            "app:sym",
+							Kind:          "function",
+							Name:          "run",
+							QualifiedName: "service.run",
+							FilePath:      "service.go",
+						},
+						Count: 1,
+					}},
+				},
+				{
+					RepoKey: tc.repoKey,
+					Candidates: []workspaceGraphSymbolRef{{
+						RepoKey:       tc.repoKey,
+						ID:            "pkg:sym",
+						Kind:          "class",
+						Name:          tc.targetName,
+						QualifiedName: tc.qualifiedName,
+						FilePath:      tc.filePath,
+					}},
+				},
+			}, 10)
+			if len(edges) != 1 {
+				t.Fatalf("%s package import edges = %#v", tc.name, edges)
+			}
+			edge := edges[0]
+			if edge.RelationKind != "cross_repo_import_candidate" ||
+				edge.Endpoint != "external:import:"+tc.spec ||
+				edge.FromRepo != "local/app" ||
+				edge.ToRepo != tc.repoKey ||
+				edge.ToSymbol.FilePath != tc.filePath ||
+				edge.ToSymbol.Direction != "import_symbol_target" {
+				t.Fatalf("unexpected %s package import edge: %#v", tc.name, edge)
+			}
+		})
+	}
+}
+
+func TestWorkspaceGraphMatchesKubernetesResourceCandidates(t *testing.T) {
+	tests := []struct {
+		name       string
+		endpoint   string
+		targetID   string
+		targetName string
+		filePath   string
+	}{
+		{
+			name:       "service",
+			endpoint:   "external:config:kubernetes/service/api",
+			targetID:   "platform:resource:Service.api",
+			targetName: "Service.api",
+			filePath:   "k8s/service.yaml",
+		},
+		{
+			name:       "configmap",
+			endpoint:   "external:config:kubernetes/configmap/podinfo-values",
+			targetID:   "platform:resource:ConfigMap.podinfo-values",
+			targetName: "ConfigMap.podinfo-values",
+			filePath:   "k8s/podinfo-values.yaml",
+		},
+		{
+			name:       "secret",
+			endpoint:   "external:config:kubernetes/secret/podinfo-secret-values",
+			targetID:   "platform:resource:Secret.podinfo-secret-values",
+			targetName: "Secret.podinfo-secret-values",
+			filePath:   "k8s/podinfo-secret-values.yaml",
+		},
+		{
+			name:       "namespaced-secret-qualified",
+			endpoint:   "external:config:kubernetes/secret/default/podinfo-secret-values",
+			targetID:   "platform:resource:Secret.default.podinfo-secret-values",
+			targetName: "Secret.default.podinfo-secret-values",
+			filePath:   "k8s/default-podinfo-secret-values.yaml",
+		},
+		{
+			name:       "namespaced-secret-short-fallback",
+			endpoint:   "external:config:kubernetes/secret/default/podinfo-secret-values",
+			targetID:   "platform:resource:Secret.podinfo-secret-values",
+			targetName: "Secret.podinfo-secret-values",
+			filePath:   "k8s/podinfo-secret-values.yaml",
+		},
+		{
+			name:       "custom-resource",
+			endpoint:   "external:config:kubernetes/broker/default",
+			targetID:   "platform:resource:Broker.default",
+			targetName: "Broker.default",
+			filePath:   "k8s/knative-broker.yaml",
+		},
+		{
+			name:       "custom-resource-channel",
+			endpoint:   "external:config:kubernetes/inmemorychannel/user-events",
+			targetID:   "platform:resource:InMemoryChannel.user-events",
+			targetName: "InMemoryChannel.user-events",
+			filePath:   "k8s/knative-channel.yaml",
+		},
+		{
+			name:       "custom-resource-revision",
+			endpoint:   "external:config:kubernetes/revision/user-api-00001",
+			targetID:   "platform:resource:Revision.user-api-00001",
+			targetName: "Revision.user-api-00001",
+			filePath:   "k8s/knative-revision.yaml",
+		},
+		{
+			name:       "gateway",
+			endpoint:   "external:config:kubernetes/gateway/public",
+			targetID:   "platform:resource:Gateway.public",
+			targetName: "Gateway.public",
+			filePath:   "k8s/gateway.yaml",
+		},
+		{
+			name:       "vpa-workload-target",
+			endpoint:   "external:config:kubernetes/deployment/api",
+			targetID:   "platform:resource:Deployment.api",
+			targetName: "Deployment.api",
+			filePath:   "k8s/deployment.yaml",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			edges := workspaceGraphResourceCrossEdges(map[string]*workspaceExternalContractAggregate{
+				"RESOURCE_DEPENDS_ON\x00" + tc.endpoint: {
+					Endpoint:   tc.endpoint,
+					Type:       "RESOURCE_DEPENDS_ON",
+					RepoCounts: map[string]int{"local/app": 1},
+					Participants: []workspaceGraphSymbolRef{{
+						RepoKey:       "local/app",
+						ID:            "app:resource:Deployment.api",
+						Kind:          "resource",
+						Name:          "Deployment.api",
+						QualifiedName: "Deployment.api",
+						FilePath:      "k8s/deployment.yaml",
+						Direction:     "to_endpoint",
+						Count:         1,
+					}},
+				},
+			}, []workspaceRepoGraphIndex{
+				{
+					RepoKey: "local/app",
+				},
+				{
+					RepoKey: "local/platform",
+					Candidates: []workspaceGraphSymbolRef{{
+						RepoKey:       "local/platform",
+						ID:            tc.targetID,
+						Kind:          "resource",
+						Name:          tc.targetName,
+						QualifiedName: tc.targetName,
+						FilePath:      tc.filePath,
+					}},
+				},
+			}, 10)
+			if len(edges) != 1 {
+				t.Fatalf("kubernetes resource candidate edges = %#v", edges)
+			}
+			edge := edges[0]
+			if edge.RelationKind != "cross_repo_resource_candidate" ||
+				edge.Endpoint != tc.endpoint ||
+				edge.Type != "RESOURCE_DEPENDS_ON" ||
+				edge.FromRepo != "local/app" ||
+				edge.ToRepo != "local/platform" ||
+				edge.ToSymbol.ID != tc.targetID ||
+				edge.ToSymbol.Direction != "external_resource_target" {
+				t.Fatalf("unexpected kubernetes resource candidate edge: %#v", edge)
+			}
+		})
+	}
+}
+
+func TestWorkspaceGraphMatchesComposeServiceResourceCandidates(t *testing.T) {
+	edges := workspaceGraphResourceCrossEdges(map[string]*workspaceExternalContractAggregate{
+		"RESOURCE_DEPENDS_ON\x00external:config:compose/service/db": {
+			Endpoint:   "external:config:compose/service/db",
+			Type:       "RESOURCE_DEPENDS_ON",
+			RepoCounts: map[string]int{"local/app": 1},
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/app",
+				ID:            "app:resource:compose.service.api",
+				Kind:          "resource",
+				Name:          "compose.service.api",
+				QualifiedName: "compose.service.api",
+				FilePath:      "compose.yaml",
+				Direction:     "to_endpoint",
+				Count:         1,
+			}},
+		},
+	}, []workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+		},
+		{
+			RepoKey: "local/platform",
+			Candidates: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/platform",
+				ID:            "platform:resource:compose.service.db",
+				Kind:          "resource",
+				Name:          "compose.service.db",
+				QualifiedName: "compose.service.db",
+				FilePath:      "docker-compose.yml",
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("compose resource candidate edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_resource_candidate" ||
+		edge.Endpoint != "external:config:compose/service/db" ||
+		edge.Type != "RESOURCE_DEPENDS_ON" ||
+		edge.FromRepo != "local/app" ||
+		edge.ToRepo != "local/platform" ||
+		edge.ToSymbol.ID != "platform:resource:compose.service.db" ||
+		edge.ToSymbol.Direction != "external_resource_target" {
+		t.Fatalf("unexpected compose resource candidate edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphReportsCrossRepoChannelFlows(t *testing.T) {
+	edges := workspaceGraphChannelCrossEdges(map[string]*workspaceExternalContractAggregate{
+		"EMITS\x00external:channel:user.created": {
+			Endpoint:   "external:channel:user.created",
+			Type:       "EMITS",
+			RepoCounts: map[string]int{"local/api": 1},
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/api",
+				ID:            "api:sym:createUser",
+				Kind:          "function",
+				Name:          "createUser",
+				QualifiedName: "users.createUser",
+				FilePath:      "src/users.ts",
+				Direction:     "to_endpoint",
+				Count:         1,
+			}},
+		},
+		"LISTENS_ON\x00external:channel:user.created": {
+			Endpoint:   "external:channel:user.created",
+			Type:       "LISTENS_ON",
+			RepoCounts: map[string]int{"local/worker": 1, "local/api": 1},
+			Participants: []workspaceGraphSymbolRef{
+				{
+					RepoKey:       "local/worker",
+					ID:            "worker:sym:onUserCreated",
+					Kind:          "function",
+					Name:          "onUserCreated",
+					QualifiedName: "events.onUserCreated",
+					FilePath:      "src/events.ts",
+					Direction:     "to_endpoint",
+					Count:         1,
+				},
+				{
+					RepoKey:       "local/api",
+					ID:            "api:sym:localAudit",
+					Kind:          "function",
+					Name:          "localAudit",
+					QualifiedName: "users.localAudit",
+					FilePath:      "src/users.ts",
+					Direction:     "to_endpoint",
+					Count:         1,
+				},
+			},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("channel flow edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_channel_flow" ||
+		edge.Endpoint != "external:channel:user.created" ||
+		edge.Type != "EMITS" ||
+		edge.FromRepo != "local/api" ||
+		edge.ToRepo != "local/worker" ||
+		edge.FromSymbol.QualifiedName != "users.createUser" ||
+		edge.ToSymbol.QualifiedName != "events.onUserCreated" {
+		t.Fatalf("unexpected channel flow edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphReportsCrossRepoGraphQLCalls(t *testing.T) {
+	edges := workspaceGraphGraphQLCrossEdges(map[string]*workspaceExternalContractAggregate{
+		"HANDLES_GRAPHQL\x00external:graphql:query user": {
+			Endpoint:   "external:graphql:query user",
+			Type:       "HANDLES_GRAPHQL",
+			RepoCounts: map[string]int{"local/web": 1, "local/api": 1},
+			Participants: []workspaceGraphSymbolRef{
+				{
+					RepoKey:       "local/web",
+					ID:            "web:sym:fetchUser",
+					Kind:          "function",
+					Name:          "fetchUser",
+					QualifiedName: "client.fetchUser",
+					FilePath:      "src/client.ts",
+					Direction:     "to_endpoint",
+					Count:         1,
+				},
+				{
+					RepoKey:       "local/schema",
+					ID:            "schema:sym:Query.user",
+					Kind:          "graphql_schema_field",
+					Name:          "Query.user",
+					QualifiedName: "Query.user",
+					FilePath:      "schema.graphql",
+					Direction:     "to_endpoint",
+					Count:         1,
+				},
+				{
+					RepoKey:       "local/api",
+					ID:            "api:sym:Query.user",
+					Kind:          "graphql_resolver",
+					Name:          "Query.user",
+					QualifiedName: "Query.user",
+					FilePath:      "src/resolvers.ts",
+					Direction:     "to_endpoint",
+					Count:         1,
+				},
+			},
+		},
+		"HANDLES_GRAPHQL\x00external:graphql:query viewer": {
+			Endpoint:   "external:graphql:query viewer",
+			Type:       "HANDLES_GRAPHQL",
+			RepoCounts: map[string]int{"local/web": 1, "local/other": 1},
+			Participants: []workspaceGraphSymbolRef{
+				{RepoKey: "local/web", ID: "web:sym:fetchViewer", Kind: "function", Name: "fetchViewer", Count: 1},
+				{RepoKey: "local/other", ID: "other:sym:fetchViewer", Kind: "function", Name: "fetchViewer", Count: 1},
+			},
+		},
+	}, 10)
+	if len(edges) != 3 {
+		t.Fatalf("graphql cross edges = %#v", edges)
+	}
+	seen := map[string]workspaceGraphCrossEdge{}
+	for _, edge := range edges {
+		seen[edge.RelationKind+"->"+edge.ToSymbol.Kind] = edge
+		if edge.FromSymbol.Kind == "graphql_schema_field" && edge.RelationKind != "cross_repo_graphql_schema_resolver" {
+			t.Fatalf("schema field was used as GraphQL operation source: %#v", edge)
+		}
+	}
+	resolverEdge := seen["cross_repo_graphql_call->graphql_resolver"]
+	if resolverEdge.Endpoint != "external:graphql:query user" ||
+		resolverEdge.Type != "CALLS" ||
+		resolverEdge.FromRepo != "local/web" ||
+		resolverEdge.ToRepo != "local/api" {
+		t.Fatalf("unexpected GraphQL resolver cross edge: %#v", resolverEdge)
+	}
+	schemaEdge := seen["cross_repo_graphql_schema->graphql_schema_field"]
+	if schemaEdge.Endpoint != "external:graphql:query user" ||
+		schemaEdge.Type != "CALLS" ||
+		schemaEdge.FromRepo != "local/web" ||
+		schemaEdge.ToRepo != "local/schema" {
+		t.Fatalf("unexpected GraphQL schema cross edge: %#v", schemaEdge)
+	}
+	schemaResolverEdge := seen["cross_repo_graphql_schema_resolver->graphql_resolver"]
+	if schemaResolverEdge.Endpoint != "external:graphql:query user" ||
+		schemaResolverEdge.Type != "CALLS" ||
+		schemaResolverEdge.FromRepo != "local/schema" ||
+		schemaResolverEdge.ToRepo != "local/api" {
+		t.Fatalf("unexpected GraphQL schema resolver cross edge: %#v", schemaResolverEdge)
+	}
+}
+
+func TestWorkspaceGraphReportsCrossRepoGraphQLSchemaResolverWithoutOperation(t *testing.T) {
+	edges := workspaceGraphGraphQLCrossEdges(map[string]*workspaceExternalContractAggregate{
+		"HANDLES_GRAPHQL\x00external:graphql:query user": {
+			Endpoint:   "external:graphql:query user",
+			Type:       "HANDLES_GRAPHQL",
+			RepoCounts: map[string]int{"local/schema": 1, "local/api": 1},
+			Participants: []workspaceGraphSymbolRef{
+				{
+					RepoKey:       "local/schema",
+					ID:            "schema:sym:Query.user",
+					Kind:          "graphql_schema_field",
+					Name:          "Query.user",
+					QualifiedName: "Query.user",
+					FilePath:      "schema.graphql",
+					Direction:     "to_endpoint",
+					Count:         1,
+				},
+				{
+					RepoKey:       "local/api",
+					ID:            "api:sym:Query.user",
+					Kind:          "graphql_resolver",
+					Name:          "Query.user",
+					QualifiedName: "Query.user",
+					FilePath:      "src/user.resolvers.ts",
+					Direction:     "to_endpoint",
+					Count:         1,
+				},
+			},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("graphql schema resolver-only cross edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.Endpoint != "external:graphql:query user" ||
+		edge.Type != "CALLS" ||
+		edge.RelationKind != "cross_repo_graphql_schema_resolver" ||
+		edge.FromRepo != "local/schema" ||
+		edge.ToRepo != "local/api" ||
+		edge.FromSymbol.Kind != "graphql_schema_field" ||
+		edge.ToSymbol.Kind != "graphql_resolver" {
+		t.Fatalf("unexpected GraphQL schema resolver-only cross edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphImportCandidatesPreferImportedSymbols(t *testing.T) {
+	edges := workspaceGraphImportCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			Imports: []workspaceGraphImportRef{{
+				Spec: "requests.auth.HTTPBasicAuth",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "run",
+					QualifiedName: "service.run",
+					FilePath:      "service.py",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "pypi/requests",
+			Candidates: []workspaceGraphSymbolRef{
+				{
+					RepoKey:       "pypi/requests",
+					ID:            "module:sym",
+					Kind:          "module",
+					Name:          "auth",
+					QualifiedName: "auth",
+					FilePath:      "requests/auth.py",
+				},
+				{
+					RepoKey:       "pypi/requests",
+					ID:            "class:sym",
+					Kind:          "class",
+					Name:          "HTTPBasicAuth",
+					QualifiedName: "auth.HTTPBasicAuth",
+					FilePath:      "requests/auth.py",
+				},
+			},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("python import symbol edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_import_candidate" ||
+		edge.Endpoint != "external:import:requests.auth.HTTPBasicAuth" ||
+		edge.ToRepo != "pypi/requests" ||
+		edge.ToSymbol.ID != "class:sym" ||
+		edge.ToSymbol.Direction != "import_symbol_target" {
+		t.Fatalf("unexpected python import symbol edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphImportCandidatesPreferSubpathFileTargets(t *testing.T) {
+	edges := workspaceGraphImportCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			Imports: []workspaceGraphImportRef{{
+				Spec: "@acme/ui/button",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "render",
+					QualifiedName: "app.render",
+					FilePath:      "src/app.ts",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "gh/acme/web/packages/ui",
+			Candidates: []workspaceGraphSymbolRef{
+				{
+					RepoKey:       "gh/acme/web/packages/ui",
+					ID:            "alpha:file",
+					Kind:          "file",
+					Name:          "alpha",
+					QualifiedName: "alpha",
+					FilePath:      "src/alpha.ts",
+				},
+				{
+					RepoKey:       "gh/acme/web/packages/ui",
+					ID:            "button:file",
+					Kind:          "file",
+					Name:          "button",
+					QualifiedName: "button",
+					FilePath:      "src/button.ts",
+				},
+			},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("subpath import file edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_import_candidate" ||
+		edge.Endpoint != "external:import:@acme/ui/button" ||
+		edge.ToRepo != "gh/acme/web/packages/ui" ||
+		edge.ToSymbol.ID != "button:file" ||
+		edge.ToSymbol.Direction != "import_path_target" {
+		t.Fatalf("unexpected subpath import file edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceImportPathMatchesSubpath(t *testing.T) {
+	tests := []struct {
+		path    string
+		subpath string
+		want    bool
+	}{
+		{path: "src/button.ts", subpath: "button", want: true},
+		{path: "src/api/routes.ts", subpath: "api/routes", want: true},
+		{path: "src/api/routes.ts", subpath: "routes", want: true},
+		{path: "requests/auth.py", subpath: "auth", want: true},
+		{path: "tokio/sync/channel.rs", subpath: "sync::channel", want: true},
+		{path: "pkg/service.go", subpath: "v2/pkg", want: true},
+		{path: "src/alpha.ts", subpath: "button", want: false},
+	}
+	for _, tt := range tests {
+		if got := workspaceImportPathMatchesSubpath(tt.path, tt.subpath); got != tt.want {
+			t.Fatalf("workspaceImportPathMatchesSubpath(%q, %q) = %v, want %v", tt.path, tt.subpath, got, tt.want)
+		}
+	}
+}
+
+func TestWorkspaceGraphReportsCrossRepoRouteCalls(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	opts := Options{Version: "test", Env: env, Runner: runner, Now: func() time.Time { return time.Date(2026, 6, 20, 14, 30, 0, 0, time.UTC) }}
+	cmd := &cobra.Command{Use: "index"}
+
+	repoA := t.TempDir()
+	keyA := testLocalRepoStorageKey(t, repoA)
+	repoB := t.TempDir()
+	keyB := testLocalRepoStorageKey(t, repoB)
+	indexWorkspaceGraphRepoWithSnapshot(t, cmd, opts, runner, repoA, keyA, workspaceGraphRouteCallerSnapshot(keyA, "CallShared", "/shared"))
+	indexWorkspaceGraphRepoWithSnapshot(t, cmd, opts, runner, repoB, keyB, workspaceGraphRouteHandlerSnapshot(keyB, "HandleShared", "/shared"))
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "routes",
+		Repos: []workspaceRepo{
+			{RepoKey: keyA, LocalPathHint: repoA},
+			{RepoKey: keyB, LocalPathHint: repoB},
+		},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	var out bytes.Buffer
+	graphCmd := &cobra.Command{Use: "graph"}
+	graphCmd.SetOut(&out)
+	if err := runWorkspaceGraph(graphCmd, opts, workspaceGraphOptions{limit: 10, json: true}, "routes"); err != nil {
+		t.Fatalf("workspace graph: %v", err)
+	}
+	for _, want := range []string{
+		`"relation_kind": "cross_repo_route_call"`,
+		`external:route:/shared`,
+		`"type": "CALLS"`,
+		`"from_repo": "` + keyA + `"`,
+		`"to_repo": "` + keyB + `"`,
+		`"qualified_name": "service.CallShared"`,
+		`"qualified_name": "service.HandleShared"`,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("workspace graph route call edge missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestWorkspaceGraphMatchesCanonicalRouteTemplateCalls(t *testing.T) {
+	edges := workspaceGraphRouteCallCrossEdges(map[string]*workspaceExternalContractAggregate{
+		"HTTP_CALLS\x00external:route:/api/users/{id}": {
+			Endpoint: "external:route:/api/users/{id}",
+			Type:     "HTTP_CALLS",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/client",
+				ID:            "local/client:go:client.go:function:CallUser",
+				Kind:          "function",
+				Name:          "CallUser",
+				QualifiedName: "client.CallUser",
+				Count:         1,
+			}},
+		},
+		"HANDLES_ROUTE\x00external:route:/api/users/:userID": {
+			Endpoint: "external:route:/api/users/:userID",
+			Type:     "HANDLES_ROUTE",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/service",
+				ID:            "local/service:ts:routes.ts:function:showUser",
+				Kind:          "function",
+				Name:          "showUser",
+				QualifiedName: "routes.showUser",
+				Count:         1,
+			}},
+		},
+		"HANDLES_ROUTE\x00external:route:/api/projects/<project_id>": {
+			Endpoint: "external:route:/api/projects/<project_id>",
+			Type:     "HANDLES_ROUTE",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/other",
+				ID:            "local/other:py:routes.py:function:show_project",
+				Kind:          "function",
+				Name:          "show_project",
+				QualifiedName: "routes.show_project",
+				Count:         1,
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("expected exactly one canonical route edge, got %#v", edges)
+	}
+	edge := edges[0]
+	if edge.Endpoint != "external:route:/api/users/{param}" ||
+		edge.RelationKind != "cross_repo_route_call" ||
+		edge.FromRepo != "local/client" ||
+		edge.ToRepo != "local/service" ||
+		edge.FromSymbol.QualifiedName != "client.CallUser" ||
+		edge.ToSymbol.QualifiedName != "routes.showUser" {
+		t.Fatalf("unexpected canonical route edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesTrailingSlashRouteCalls(t *testing.T) {
+	edges := workspaceGraphRouteCallCrossEdges(map[string]*workspaceExternalContractAggregate{
+		"HTTP_CALLS\x00external:route:/health": {
+			Endpoint: "external:route:/health",
+			Type:     "HTTP_CALLS",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/client",
+				ID:            "local/client:go:client.go:function:CheckHealth",
+				Kind:          "function",
+				Name:          "CheckHealth",
+				QualifiedName: "client.CheckHealth",
+				Count:         1,
+			}},
+		},
+		"HANDLES_ROUTE\x00external:route:/health/": {
+			Endpoint: "external:route:/health/",
+			Type:     "HANDLES_ROUTE",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/service",
+				ID:            "local/service:py:routes.py:function:health",
+				Kind:          "function",
+				Name:          "health",
+				QualifiedName: "routes.health",
+				Count:         1,
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("expected trailing-slash route edge, got %#v", edges)
+	}
+	edge := edges[0]
+	if edge.Endpoint != "external:route:/health" ||
+		edge.RelationKind != "cross_repo_route_call" ||
+		edge.FromRepo != "local/client" ||
+		edge.ToRepo != "local/service" ||
+		edge.FromSymbol.QualifiedName != "client.CheckHealth" ||
+		edge.ToSymbol.QualifiedName != "routes.health" {
+		t.Fatalf("unexpected trailing-slash route edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesFrontendOptionalRouteTemplateCalls(t *testing.T) {
+	edges := workspaceGraphRouteCallCrossEdges(map[string]*workspaceExternalContractAggregate{
+		"HTTP_CALLS\x00external:route:/docs/{lang}": {
+			Endpoint: "external:route:/docs/{lang}",
+			Type:     "HTTP_CALLS",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/client",
+				ID:            "local/client:ts:client.ts:function:loadDocs",
+				Kind:          "function",
+				Name:          "loadDocs",
+				QualifiedName: "client.loadDocs",
+				Count:         1,
+			}},
+		},
+		"HANDLES_ROUTE\x00external:route:/docs/[[lang]]": {
+			Endpoint: "external:route:/docs/[[lang]]",
+			Type:     "HANDLES_ROUTE",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/web",
+				ID:            "local/web:ts:src/routes/docs/[[lang]]/+server.ts:function:GET",
+				Kind:          "function",
+				Name:          "GET",
+				QualifiedName: "routes.docs.GET",
+				Count:         1,
+			}},
+		},
+		"HTTP_CALLS\x00external:route:/blog/{slug}": {
+			Endpoint: "external:route:/blog/{slug}",
+			Type:     "HTTP_CALLS",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/client",
+				ID:            "local/client:ts:client.ts:function:loadBlog",
+				Kind:          "function",
+				Name:          "loadBlog",
+				QualifiedName: "client.loadBlog",
+				Count:         1,
+			}},
+		},
+		"HANDLES_ROUTE\x00external:route:/blog/[...slug]": {
+			Endpoint: "external:route:/blog/[...slug]",
+			Type:     "HANDLES_ROUTE",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/web",
+				ID:            "local/web:ts:src/routes/blog/[...slug]/+server.ts:function:GET",
+				Kind:          "function",
+				Name:          "GET",
+				QualifiedName: "routes.blog.GET",
+				Count:         1,
+			}},
+		},
+	}, 10)
+	if len(edges) != 2 {
+		t.Fatalf("expected frontend route template edges, got %#v", edges)
+	}
+	seen := map[string]workspaceGraphCrossEdge{}
+	for _, edge := range edges {
+		seen[edge.Endpoint] = edge
+	}
+	if edge := seen["external:route:/docs/{param}"]; edge.RelationKind != "cross_repo_route_call" || edge.FromRepo != "local/client" || edge.ToRepo != "local/web" || edge.ToSymbol.QualifiedName != "routes.docs.GET" {
+		t.Fatalf("unexpected optional frontend route edge: %#v", edge)
+	}
+	if edge := seen["external:route:/blog/{param}"]; edge.RelationKind != "cross_repo_route_call" || edge.FromRepo != "local/client" || edge.ToRepo != "local/web" || edge.ToSymbol.QualifiedName != "routes.blog.GET" {
+		t.Fatalf("unexpected catch-all frontend route edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesWildcardRouteTemplateCalls(t *testing.T) {
+	edges := workspaceGraphRouteCallCrossEdges(map[string]*workspaceExternalContractAggregate{
+		"HTTP_CALLS\x00external:route:/assets/{path}": {
+			Endpoint: "external:route:/assets/{path}",
+			Type:     "HTTP_CALLS",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/client",
+				ID:            "local/client:rb:client.rb:method:fetch_asset",
+				Kind:          "method",
+				Name:          "fetch_asset",
+				QualifiedName: "Client.fetch_asset",
+				Count:         1,
+			}},
+		},
+		"HANDLES_ROUTE\x00external:route:/assets/*path": {
+			Endpoint: "external:route:/assets/*path",
+			Type:     "HANDLES_ROUTE",
+			Participants: []workspaceGraphSymbolRef{{
+				RepoKey:       "local/web",
+				ID:            "local/web:rb:config/routes.rb:method:AssetsController.show",
+				Kind:          "method",
+				Name:          "show",
+				QualifiedName: "AssetsController.show",
+				Count:         1,
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("expected wildcard route edge, got %#v", edges)
+	}
+	edge := edges[0]
+	if edge.Endpoint != "external:route:/assets/{param}" ||
+		edge.RelationKind != "cross_repo_route_call" ||
+		edge.FromRepo != "local/client" ||
+		edge.ToRepo != "local/web" ||
+		edge.ToSymbol.QualifiedName != "AssetsController.show" {
+		t.Fatalf("unexpected wildcard route edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphReportsExactExternalSymbolEdges(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	opts := Options{Version: "test", Env: env, Runner: runner, Now: func() time.Time { return time.Date(2026, 6, 20, 14, 0, 0, 0, time.UTC) }}
+	cmd := &cobra.Command{Use: "index"}
+
+	repoA := t.TempDir()
+	keyA := testLocalRepoStorageKey(t, repoA)
+	repoB := t.TempDir()
+	keyB := testLocalRepoStorageKey(t, repoB)
+	indexWorkspaceGraphRepoWithSnapshot(t, cmd, opts, runner, repoA, keyA, workspaceGraphExternalSymbolSnapshot(keyA, "HandleAPI", "lib.Service"))
+	indexWorkspaceGraphRepoWithSnapshot(t, cmd, opts, runner, repoB, keyB, workspaceGraphQualifiedSymbolSnapshot(keyB, "lib/service.go", "Service", "lib.Service"))
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "symbols",
+		Repos: []workspaceRepo{
+			{RepoKey: keyA, LocalPathHint: repoA},
+			{RepoKey: keyB, LocalPathHint: repoB},
+		},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	var out bytes.Buffer
+	graphCmd := &cobra.Command{Use: "graph"}
+	graphCmd.SetOut(&out)
+	if err := runWorkspaceGraph(graphCmd, opts, workspaceGraphOptions{limit: 10, json: true}, "symbols"); err != nil {
+		t.Fatalf("workspace graph: %v", err)
+	}
+	for _, want := range []string{
+		`"relation_kind": "cross_repo_external_symbol"`,
+		`external:symbol:lib.Service`,
+		`"from_repo": "` + keyA + `"`,
+		`"to_repo": "` + keyB + `"`,
+		`"qualified_name": "lib.Service"`,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("workspace graph external symbol edge missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestWorkspaceGraphMatchesRepoPrefixedExternalSymbols(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	opts := Options{Version: "test", Env: env, Runner: runner, Now: func() time.Time { return time.Date(2026, 6, 20, 14, 0, 0, 0, time.UTC) }}
+	cmd := &cobra.Command{Use: "index"}
+
+	repoA := t.TempDir()
+	keyA := testLocalRepoStorageKey(t, repoA)
+	repoB := t.TempDir()
+	keyB := testLocalRepoStorageKey(t, repoB)
+	externalSpec := keyB + "/pkg.Service"
+	indexWorkspaceGraphRepoWithSnapshot(t, cmd, opts, runner, repoA, keyA, workspaceGraphExternalSymbolSnapshot(keyA, "HandleAPI", externalSpec))
+	indexWorkspaceGraphRepoWithSnapshot(t, cmd, opts, runner, repoB, keyB, workspaceGraphQualifiedSymbolSnapshot(keyB, "pkg/service.go", "Service", "pkg.Service"))
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "prefixed-symbols",
+		Repos: []workspaceRepo{
+			{RepoKey: keyA, LocalPathHint: repoA},
+			{RepoKey: keyB, LocalPathHint: repoB},
+		},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	var out bytes.Buffer
+	graphCmd := &cobra.Command{Use: "graph"}
+	graphCmd.SetOut(&out)
+	if err := runWorkspaceGraph(graphCmd, opts, workspaceGraphOptions{limit: 10, json: true}, "prefixed-symbols"); err != nil {
+		t.Fatalf("workspace graph: %v", err)
+	}
+	for _, want := range []string{
+		`"relation_kind": "cross_repo_external_symbol"`,
+		`external:symbol:` + externalSpec,
+		`"to_repo": "` + keyB + `"`,
+		`"qualified_name": "pkg.Service"`,
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("workspace graph repo-prefixed external symbol edge missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestWorkspaceGraphMatchesPackageRepoExternalSymbols(t *testing.T) {
+	edges := workspaceGraphExternalSymbolCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			ExternalSymbols: []workspaceGraphExternalSymbolRef{{
+				Spec: "@acme/lib/pkg.Service",
+				Type: "CALLS",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "HandleAPI",
+					QualifiedName: "service.HandleAPI",
+					FilePath:      "service.go",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "npm/@acme/lib",
+			Candidates: []workspaceGraphSymbolRef{{
+				RepoKey:       "npm/@acme/lib",
+				ID:            "lib:sym",
+				Kind:          "function",
+				Name:          "Service",
+				QualifiedName: "pkg.Service",
+				FilePath:      "pkg/service.ts",
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("package repo external symbol edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_external_symbol" || edge.Endpoint != "external:symbol:@acme/lib/pkg.Service" || edge.FromRepo != "local/app" || edge.ToRepo != "npm/@acme/lib" || edge.ToSymbol.QualifiedName != "pkg.Service" {
+		t.Fatalf("unexpected package repo external symbol edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesMavenExternalSymbols(t *testing.T) {
+	edges := workspaceGraphExternalSymbolCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			ExternalSymbols: []workspaceGraphExternalSymbolRef{{
+				Spec: "com.acme.lib.Service",
+				Type: "CALLS",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "Run",
+					QualifiedName: "service.Run",
+					FilePath:      "App.java",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "maven/com.acme/lib",
+			Candidates: []workspaceGraphSymbolRef{{
+				RepoKey:       "maven/com.acme/lib",
+				ID:            "lib:sym",
+				Kind:          "class",
+				Name:          "Service",
+				QualifiedName: "Service",
+				FilePath:      "Service.java",
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("maven external symbol edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_external_symbol" || edge.Endpoint != "external:symbol:com.acme.lib.Service" || edge.FromRepo != "local/app" || edge.ToRepo != "maven/com.acme/lib" || edge.ToSymbol.QualifiedName != "Service" {
+		t.Fatalf("unexpected maven external symbol edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceGraphMatchesAdditionalPackageExternalSymbols(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		spec          string
+		repoKey       string
+		targetName    string
+		qualifiedName string
+		filePath      string
+	}{
+		{
+			name:          "nuget",
+			spec:          "Newtonsoft.Json.Linq.JToken",
+			repoKey:       "nuget/Newtonsoft.Json",
+			targetName:    "JToken",
+			qualifiedName: "Linq.JToken",
+			filePath:      "Src/Newtonsoft.Json/Linq/JToken.cs",
+		},
+		{
+			name:          "pypi hyphen underscore alias",
+			spec:          "acme_client.transport.Client",
+			repoKey:       "pypi/acme-client",
+			targetName:    "Client",
+			qualifiedName: "transport.Client",
+			filePath:      "acme_client/transport.py",
+		},
+		{
+			name:          "cargo hyphen underscore alias",
+			spec:          "tokio_util::codec::Framed",
+			repoKey:       "cargo/tokio-util",
+			targetName:    "Framed",
+			qualifiedName: "codec.Framed",
+			filePath:      "src/codec/framed.rs",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			edges := workspaceGraphExternalSymbolCrossEdges([]workspaceRepoGraphIndex{
+				{
+					RepoKey: "local/app",
+					ExternalSymbols: []workspaceGraphExternalSymbolRef{{
+						Spec: tc.spec,
+						Type: "CALLS",
+						Source: workspaceGraphSymbolRef{
+							RepoKey:       "local/app",
+							ID:            "app:sym",
+							Kind:          "function",
+							Name:          "Run",
+							QualifiedName: "service.Run",
+							FilePath:      "Program.cs",
+						},
+						Count: 1,
+					}},
+				},
+				{
+					RepoKey: tc.repoKey,
+					Candidates: []workspaceGraphSymbolRef{{
+						RepoKey:       tc.repoKey,
+						ID:            "pkg:sym",
+						Kind:          "class",
+						Name:          tc.targetName,
+						QualifiedName: tc.qualifiedName,
+						FilePath:      tc.filePath,
+					}},
+				},
+			}, 10)
+			if len(edges) != 1 {
+				t.Fatalf("%s external symbol edges = %#v", tc.name, edges)
+			}
+			edge := edges[0]
+			if edge.RelationKind != "cross_repo_external_symbol" ||
+				edge.Endpoint != "external:symbol:"+tc.spec ||
+				edge.FromRepo != "local/app" ||
+				edge.ToRepo != tc.repoKey ||
+				edge.ToSymbol.QualifiedName != tc.qualifiedName ||
+				edge.ToSymbol.Direction != "external_symbol_target" {
+				t.Fatalf("unexpected %s external symbol edge: %#v", tc.name, edge)
+			}
+		})
+	}
+}
+
+func TestWorkspaceGraphMatchesColonSeparatedPackageExternalSymbols(t *testing.T) {
+	edges := workspaceGraphExternalSymbolCrossEdges([]workspaceRepoGraphIndex{
+		{
+			RepoKey: "local/app",
+			ExternalSymbols: []workspaceGraphExternalSymbolRef{{
+				Spec: "tokio::sync::channel",
+				Type: "CALLS",
+				Source: workspaceGraphSymbolRef{
+					RepoKey:       "local/app",
+					ID:            "app:sym",
+					Kind:          "function",
+					Name:          "run",
+					QualifiedName: "app.run",
+					FilePath:      "src/main.rs",
+				},
+				Count: 1,
+			}},
+		},
+		{
+			RepoKey: "cargo/tokio",
+			Candidates: []workspaceGraphSymbolRef{{
+				RepoKey:       "cargo/tokio",
+				ID:            "tokio:sym",
+				Kind:          "function",
+				Name:          "channel",
+				QualifiedName: "sync.channel",
+				FilePath:      "tokio/src/sync/channel.rs",
+			}},
+		},
+	}, 10)
+	if len(edges) != 1 {
+		t.Fatalf("colon-separated package external symbol edges = %#v", edges)
+	}
+	edge := edges[0]
+	if edge.RelationKind != "cross_repo_external_symbol" ||
+		edge.Endpoint != "external:symbol:tokio::sync::channel" ||
+		edge.FromRepo != "local/app" ||
+		edge.ToRepo != "cargo/tokio" ||
+		edge.ToSymbol.QualifiedName != "sync.channel" {
+		t.Fatalf("unexpected colon-separated package external symbol edge: %#v", edge)
+	}
+}
+
+func TestWorkspaceExternalSymbolTargetMatchesGitHubRepoPrefixes(t *testing.T) {
+	target, ok := workspaceExternalSymbolTarget([]workspaceGraphSymbolRef{{
+		RepoKey:       "gh/acme/lib",
+		ID:            "sym",
+		Kind:          "function",
+		Name:          "Service",
+		QualifiedName: "pkg.Service",
+		FilePath:      "pkg/service.go",
+	}}, "github.com/acme/lib/pkg.Service")
+	if !ok || target.ID != "sym" || target.Direction != "external_symbol_target" {
+		t.Fatalf("github-prefixed external symbol target = %#v, %v", target, ok)
+	}
+}
+
+func TestWorkspaceExternalSymbolTargetMatchesGitHubMonorepoPackagePrefixes(t *testing.T) {
+	target, ok := workspaceExternalSymbolTarget([]workspaceGraphSymbolRef{{
+		RepoKey:       "gh/acme/web/packages/ui",
+		ID:            "sym",
+		Kind:          "function",
+		Name:          "Button",
+		QualifiedName: "button.Button",
+		FilePath:      "src/button.ts",
+	}}, "@acme/ui/button.Button")
+	if !ok || target.ID != "sym" || target.Direction != "external_symbol_target" {
+		t.Fatalf("github monorepo package external symbol target = %#v, %v", target, ok)
+	}
+}
+
+func TestWorkspaceExternalSymbolTargetMatchesGitHubMonorepoPackageAliases(t *testing.T) {
+	target, ok := workspaceExternalSymbolTarget([]workspaceGraphSymbolRef{{
+		RepoKey:       "gh/acme/web/packages/my-lib",
+		ID:            "sym",
+		Kind:          "function",
+		Name:          "Button",
+		QualifiedName: "button.Button",
+		FilePath:      "src/button.ts",
+	}}, "@acme/my_lib/button.Button")
+	if !ok || target.ID != "sym" || target.Direction != "external_symbol_target" {
+		t.Fatalf("github monorepo package alias external symbol target = %#v, %v", target, ok)
+	}
+}
+
+func TestWorkspaceExternalSymbolTargetMatchesPackageRepoPrefixes(t *testing.T) {
+	target, ok := workspaceExternalSymbolTarget([]workspaceGraphSymbolRef{{
+		RepoKey:       "npm/@acme/lib",
+		ID:            "sym",
+		Kind:          "function",
+		Name:          "Service",
+		QualifiedName: "pkg.Service",
+		FilePath:      "pkg/service.ts",
+	}}, "@acme/lib/pkg.Service")
+	if !ok || target.ID != "sym" || target.Direction != "external_symbol_target" {
+		t.Fatalf("package-prefixed external symbol target = %#v, %v", target, ok)
+	}
+}
+
+func TestWorkspaceExternalSymbolTargetMatchesFileQualifiedSymbols(t *testing.T) {
+	target, ok := workspaceExternalSymbolTarget([]workspaceGraphSymbolRef{
+		{
+			RepoKey:       "npm/@acme/lib",
+			ID:            "broad",
+			Kind:          "function",
+			Name:          "Handler",
+			QualifiedName: "other.Handler",
+			FilePath:      "src/other.ts",
+		},
+		{
+			RepoKey:       "npm/@acme/lib",
+			ID:            "target",
+			Kind:          "function",
+			Name:          "Handler",
+			QualifiedName: "Handler",
+			FilePath:      "src/api/routes.ts",
+		},
+	}, "@acme/lib/api/routes.Handler")
+	if !ok || target.ID != "target" || target.Direction != "external_symbol_target" {
+		t.Fatalf("file-qualified external symbol target = %#v, %v", target, ok)
+	}
+}
+
+func TestWorkspaceExternalSymbolTargetMatchesColonSeparatedPackagePrefixes(t *testing.T) {
+	target, ok := workspaceExternalSymbolTarget([]workspaceGraphSymbolRef{{
+		RepoKey:       "cargo/tokio",
+		ID:            "sym",
+		Kind:          "function",
+		Name:          "channel",
+		QualifiedName: "sync.channel",
+		FilePath:      "src/sync/channel.rs",
+	}}, "tokio::sync::channel")
+	if !ok || target.ID != "sym" || target.Direction != "external_symbol_target" {
+		t.Fatalf("colon-separated package external symbol target = %#v, %v", target, ok)
+	}
+}
+
+func TestWorkspaceImportMatchesGitHubRepoKeys(t *testing.T) {
+	subpath, ok := workspaceImportMatchesRepo("github.com/acme/lib/pkg/sub", "gh/acme/lib")
+	if !ok || subpath != "pkg/sub" {
+		t.Fatalf("github import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("acme/lib/pkg", "gh/acme/lib")
+	if !ok || subpath != "pkg" {
+		t.Fatalf("owner/repo import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("@acme/lib/pkg", "gh/acme/lib")
+	if !ok || subpath != "pkg" {
+		t.Fatalf("scoped package import match = %q, %v", subpath, ok)
+	}
+	if _, ok := workspaceImportMatchesRepo("github.com/acme/other/pkg", "gh/acme/lib"); ok {
+		t.Fatalf("unrelated repo import should not match")
+	}
+	subpath, ok = workspaceImportMatchesRepo("@acme/ui/button", "gh/acme/web/packages/ui")
+	if !ok || subpath != "button" {
+		t.Fatalf("github monorepo package import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("github.com/acme/web/packages/ui/button", "gh/acme/web/packages/ui")
+	if !ok || subpath != "button" {
+		t.Fatalf("github monorepo path import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("@acme/my_lib/button", "gh/acme/web/packages/my-lib")
+	if !ok || subpath != "button" {
+		t.Fatalf("github monorepo package alias import match = %q, %v", subpath, ok)
+	}
+}
+
+func TestWorkspaceImportMatchesPackageRepoKeys(t *testing.T) {
+	subpath, ok := workspaceImportMatchesRepo("@acme/lib/pkg", "npm/@acme/lib")
+	if !ok || subpath != "pkg" {
+		t.Fatalf("npm scoped import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("requests/auth", "pypi/requests")
+	if !ok || subpath != "auth" {
+		t.Fatalf("pypi import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("golang.org/x/sync/errgroup", "gomod/golang.org/x/sync")
+	if !ok || subpath != "errgroup" {
+		t.Fatalf("go module import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("tokio::sync", "cargo/tokio")
+	if !ok || subpath != "sync" {
+		t.Fatalf("cargo import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("com.acme.lib.Service", "maven/com.acme/lib")
+	if !ok || subpath != "Service" {
+		t.Fatalf("maven import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("Newtonsoft.Json.Linq", "nuget/Newtonsoft.Json")
+	if !ok || subpath != "Linq" {
+		t.Fatalf("nuget import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("active_support/core_ext", "gem/active_support")
+	if !ok || subpath != "core_ext" {
+		t.Fatalf("gem import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("monolog/monolog/src/Logger", "composer/monolog/monolog")
+	if !ok || subpath != "src/Logger" {
+		t.Fatalf("composer import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("acme_client.transport", "pypi/acme-client")
+	if !ok || subpath != "transport" {
+		t.Fatalf("pypi hyphen/underscore import match = %q, %v", subpath, ok)
+	}
+	subpath, ok = workspaceImportMatchesRepo("tokio_util::codec", "cargo/tokio-util")
+	if !ok || subpath != "codec" {
+		t.Fatalf("cargo hyphen/underscore import match = %q, %v", subpath, ok)
+	}
+	if _, ok := workspaceImportMatchesRepo("@acme/other/pkg", "npm/@acme/lib"); ok {
+		t.Fatalf("unrelated package import should not match")
+	}
+}
+
+func indexWorkspaceGraphRepo(t *testing.T, cmd *cobra.Command, opts Options, runner *fakeCommandRunner, repoDir, repoKey, symbolName string) {
+	t.Helper()
+	indexWorkspaceGraphRepoWithSnapshot(t, cmd, opts, runner, repoDir, repoKey, workspaceGraphSnapshot(repoKey, symbolName))
+}
+
+func indexWorkspaceGraphRepoWithSnapshot(t *testing.T, cmd *cobra.Command, opts Options, runner *fakeCommandRunner, repoDir, repoKey, snapshot string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(repoDir, "service.go"), []byte("package service\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runner.responses = map[string]fakeCommandResponse{
+		fakeCommandKey("git", "rev-parse", "--show-toplevel"):                                                  {stdout: repoDir + "\n"},
+		fakeCommandKey("git", "rev-parse", "HEAD"):                                                             {stdout: "aaa111\n"},
+		fakeCommandKey("git", "rev-parse", "HEAD^{tree}"):                                                      {stdout: "tree111\n"},
+		fakeCommandKey("git", "branch", "--show-current"):                                                      {stdout: "main\n"},
+		fakeCommandKey("git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"):                {stdout: "origin/main\n"},
+		fakeCommandKey("git", "status", "--porcelain"):                                                         {stdout: ""},
+		fakeCommandKey("entire", "graph", "doctor", "--json"):                                                  {stdout: `{"no_egress":true}`},
+		fakeCommandKey("entire", "graph", "snapshot", "--repo", repoDir, "--format", "ndjson", "--no-network"): {stdout: snapshot},
+	}
+	if err := runSemanticIndex(cmd.Context(), cmd, opts, semanticIndexOptions{graphBinary: "entire"}, repoDir); err != nil {
+		t.Fatalf("index %s: %v", repoKey, err)
+	}
+}
+
+func workspaceGraphSnapshot(repoKey, symbolName string) string {
+	symbolID := repoKey + ":go:service.go:function:" + symbolName
+	return `{"schema_version":"1.1","provider":"entire-graph","provider_version":"0.1.0","repo_key":"` + repoKey + `","commit":"aaa111","tree":"tree111","languages":["Go"],"capabilities":["ndjson"],"profile":"full","relation_set":["DEFINES","CONFIGURES","HANDLES_ROUTE"],"warnings":[],"partial_failures":[]}
+{"record_type":"file","id":"` + repoKey + `:file:service.go","path":"service.go","blob":"abc","language":"Go","bytes":16}
+{"record_type":"symbol","id":"` + symbolID + `","kind":"function","name":"` + symbolName + `","qualified_name":"service.` + symbolName + `","file_path":"service.go","start_line":1,"end_line":1,"signature":"func ` + symbolName + `()","language":"Go","stable_id_version":"1"}
+{"record_type":"relation","from_id":"` + symbolID + `","to_id":"external:config:kubernetes/image/shared:latest","type":"CONFIGURES","confidence":0.82}
+{"record_type":"relation","from_id":"` + symbolID + `","to_id":"external:route:/shared","type":"HANDLES_ROUTE","confidence":0.95}
+{"record_type":"summary"}
+`
+}
+
+func workspaceGraphImportingSnapshot(repoKey, symbolName, importSpec string) string {
+	symbolID := repoKey + ":go:service.go:function:" + symbolName
+	return `{"schema_version":"1.1","provider":"entire-graph","provider_version":"0.1.0","repo_key":"` + repoKey + `","commit":"aaa111","tree":"tree111","languages":["Go"],"capabilities":["ndjson"],"profile":"full","relation_set":["DEFINES","IMPORTS"],"warnings":[],"partial_failures":[]}
+{"record_type":"file","id":"` + repoKey + `:file:service.go","path":"service.go","blob":"abc","language":"Go","bytes":16}
+{"record_type":"symbol","id":"` + symbolID + `","kind":"function","name":"` + symbolName + `","qualified_name":"service.` + symbolName + `","file_path":"service.go","start_line":1,"end_line":1,"signature":"func ` + symbolName + `()","language":"Go","stable_id_version":"1"}
+{"record_type":"relation","from_id":"` + symbolID + `","to_id":"external:import:` + importSpec + `","type":"IMPORTS","confidence":0.8}
+{"record_type":"summary"}
+`
+}
+
+func workspaceGraphRouteCallerSnapshot(repoKey, symbolName, route string) string {
+	symbolID := repoKey + ":go:client.go:function:" + symbolName
+	return `{"schema_version":"1.1","provider":"entire-graph","provider_version":"0.1.0","repo_key":"` + repoKey + `","commit":"aaa111","tree":"tree111","languages":["Go"],"capabilities":["ndjson"],"profile":"full","relation_set":["DEFINES","HTTP_CALLS"],"warnings":[],"partial_failures":[]}
+{"record_type":"file","id":"` + repoKey + `:file:client.go","path":"client.go","blob":"abc","language":"Go","bytes":16}
+{"record_type":"symbol","id":"` + symbolID + `","kind":"function","name":"` + symbolName + `","qualified_name":"service.` + symbolName + `","file_path":"client.go","start_line":1,"end_line":1,"signature":"func ` + symbolName + `()","language":"Go","stable_id_version":"1"}
+{"record_type":"relation","from_id":"` + symbolID + `","to_id":"external:route:` + route + `","type":"HTTP_CALLS","confidence":0.82}
+{"record_type":"summary"}
+`
+}
+
+func workspaceGraphRouteHandlerSnapshot(repoKey, symbolName, route string) string {
+	symbolID := repoKey + ":go:server.go:function:" + symbolName
+	return `{"schema_version":"1.1","provider":"entire-graph","provider_version":"0.1.0","repo_key":"` + repoKey + `","commit":"aaa111","tree":"tree111","languages":["Go"],"capabilities":["ndjson"],"profile":"full","relation_set":["DEFINES","HANDLES_ROUTE"],"warnings":[],"partial_failures":[]}
+{"record_type":"file","id":"` + repoKey + `:file:server.go","path":"server.go","blob":"abc","language":"Go","bytes":16}
+{"record_type":"symbol","id":"` + symbolID + `","kind":"function","name":"` + symbolName + `","qualified_name":"service.` + symbolName + `","file_path":"server.go","start_line":1,"end_line":1,"signature":"func ` + symbolName + `()","language":"Go","stable_id_version":"1"}
+{"record_type":"relation","from_id":"` + symbolID + `","to_id":"external:route:` + route + `","type":"HANDLES_ROUTE","confidence":0.95}
+{"record_type":"summary"}
+`
+}
+
+func workspaceGraphLibrarySnapshot(repoKey, path, symbolName string) string {
+	symbolID := repoKey + ":go:" + path + ":function:" + symbolName
+	return `{"schema_version":"1.1","provider":"entire-graph","provider_version":"0.1.0","repo_key":"` + repoKey + `","commit":"aaa111","tree":"tree111","languages":["Go"],"capabilities":["ndjson"],"profile":"full","relation_set":["DEFINES"],"warnings":[],"partial_failures":[]}
+{"record_type":"file","id":"` + repoKey + `:file:` + path + `","path":"` + path + `","blob":"abc","language":"Go","bytes":16}
+{"record_type":"symbol","id":"` + symbolID + `","kind":"function","name":"` + symbolName + `","qualified_name":"pkg.` + symbolName + `","file_path":"` + path + `","start_line":1,"end_line":1,"signature":"func ` + symbolName + `()","language":"Go","stable_id_version":"1"}
+{"record_type":"summary"}
+`
+}
+
+func workspaceGraphExternalSymbolSnapshot(repoKey, symbolName, externalQualifiedName string) string {
+	symbolID := repoKey + ":go:service.go:function:" + symbolName
+	return `{"schema_version":"1.1","provider":"entire-graph","provider_version":"0.1.0","repo_key":"` + repoKey + `","commit":"aaa111","tree":"tree111","languages":["Go"],"capabilities":["ndjson"],"profile":"full","relation_set":["CALLS"],"warnings":[],"partial_failures":[]}
+{"record_type":"file","id":"` + repoKey + `:file:service.go","path":"service.go","blob":"abc","language":"Go","bytes":16}
+{"record_type":"symbol","id":"` + symbolID + `","kind":"function","name":"` + symbolName + `","qualified_name":"service.` + symbolName + `","file_path":"service.go","start_line":1,"end_line":1,"signature":"func ` + symbolName + `()","language":"Go","stable_id_version":"1"}
+{"record_type":"relation","from_id":"` + symbolID + `","to_id":"external:symbol:` + externalQualifiedName + `","type":"CALLS","confidence":0.82}
+{"record_type":"summary"}
+`
+}
+
+func workspaceGraphQualifiedSymbolSnapshot(repoKey, path, symbolName, qualifiedName string) string {
+	symbolID := repoKey + ":go:" + path + ":function:" + symbolName
+	return `{"schema_version":"1.1","provider":"entire-graph","provider_version":"0.1.0","repo_key":"` + repoKey + `","commit":"aaa111","tree":"tree111","languages":["Go"],"capabilities":["ndjson"],"profile":"full","relation_set":["DEFINES"],"warnings":[],"partial_failures":[]}
+{"record_type":"file","id":"` + repoKey + `:file:` + path + `","path":"` + path + `","blob":"abc","language":"Go","bytes":16}
+{"record_type":"symbol","id":"` + symbolID + `","kind":"function","name":"` + symbolName + `","qualified_name":"` + qualifiedName + `","file_path":"` + path + `","start_line":1,"end_line":1,"signature":"func ` + symbolName + `()","language":"Go","stable_id_version":"1"}
+{"record_type":"summary"}
+`
+}
+
+// writeWorkspaceBrainRepo builds a sessions-only brain at brainDirForKey(env, key) plus a working
+// tree, so the cross-repo regression/review fan-out can be exercised without a semantic index.
+func writeWorkspaceBrainRepo(t *testing.T, env EntireEnv, key, sessionText, repoRel, fileBody string) string {
+	t.Helper()
+	repoDir := t.TempDir()
+	writeWorkspaceBrainRepoAt(t, env, key, repoDir, sessionText, repoRel, fileBody)
+	return repoDir
+}
+
+func writeLocalWorkspaceBrainRepo(t *testing.T, env EntireEnv, sessionText, repoRel, fileBody string) (string, string) {
+	t.Helper()
+	repoDir := t.TempDir()
+	key := testLocalRepoStorageKey(t, repoDir)
+	writeWorkspaceBrainRepoAt(t, env, key, repoDir, sessionText, repoRel, fileBody)
+	return repoDir, key
+}
+
+func writeWorkspaceBrainRepoAt(t *testing.T, env EntireEnv, key, repoDir, sessionText, repoRel, fileBody string) {
+	t.Helper()
+	brainDir := filepath.Join(env.PluginDataDir, repoStoreDirName, filepath.FromSlash(key))
+	sessDir := filepath.Join(brainDir, "sessions")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessDir, "s.jsonl"), []byte(sessionText+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	full := filepath.Join(repoDir, filepath.FromSlash(repoRel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte(fileBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkspaceReviewFlagsRegressedRepoOnly(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+
+	session := `{"text":"in pkg/review_context.go the scope diff uses scopeBaseRef+\"..HEAD\" for the range"}`
+	regressed := "package x\nfunc f() string {\n\treturn \"master..HEAD\"\n}\n"
+	clean := "package x\nfunc f() string {\n\treturn scopeBaseRef + \"..HEAD\"\n}\n"
+	repoA, keyA := writeLocalWorkspaceBrainRepo(t, env, session, "pkg/review_context.go", regressed)
+	repoB, keyB := writeLocalWorkspaceBrainRepo(t, env, session, "pkg/review_context.go", clean)
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos: []workspaceRepo{
+			{RepoKey: keyA, Name: "a", LocalPathHint: repoA},
+			{RepoKey: keyB, Name: "b", LocalPathHint: repoB},
+		},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	out, err := execute(t, cmd, "workspace", "review", "related", "fix scopeBaseRef base scope", "--json")
+	if err != nil {
+		t.Fatalf("workspace review: %v", err)
+	}
+	var payload struct {
+		SchemaVersion int                     `json:"schema_version"`
+		Mode          string                  `json:"mode"`
+		Summary       string                  `json:"summary"`
+		Results       []workspaceReviewResult `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("parse review json: %v\n%s", err, out)
+	}
+	if payload.SchemaVersion != reviewReportSchemaVersion || payload.Mode != "diff-less (brain memory vs current tree)" {
+		t.Fatalf("review envelope schema_version/mode wrong: v=%d mode=%q", payload.SchemaVersion, payload.Mode)
+	}
+	if !strings.Contains(payload.Summary, "1 suspected regression(s) across 1/2 repo(s)") {
+		t.Fatalf("summary = %q", payload.Summary)
+	}
+	byKey := map[string]workspaceReviewResult{}
+	for _, r := range payload.Results {
+		byKey[r.RepoKey] = r
+	}
+	a, okA := byKey[keyA]
+	b, okB := byKey[keyB]
+	if !okA || !okB {
+		t.Fatalf("missing workspace results: %v", byKey)
+	}
+	// changed-findings are "medium" (hedged "could be a rename"), not "high" — see regressionSeverity.
+	if len(a.Findings) != 1 || a.Findings[0].Severity != "medium" || !strings.Contains(a.Findings[0].File, "review_context.go") {
+		t.Fatalf("repoa findings wrong: %+v", a)
+	}
+	if len(b.Findings) != 0 {
+		t.Fatalf("repob (clean) should have no findings: %+v", b)
+	}
+	// The clean repo must NOT be falsely summarized; and Findings serializes as [] not null.
+	if !strings.Contains(b.Summary, "no suspected regressions") {
+		t.Fatalf("clean repo summary wrong: %q", b.Summary)
+	}
+	if !strings.Contains(out, `"findings": []`) {
+		t.Fatalf("empty findings must serialize as [] not null:\n%s", out)
+	}
+}
+
+func TestWorkspaceReviewTextOutputRendersFindingsAndFreshness(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+
+	session := `{"text":"in pkg/review_context.go the scope diff uses scopeBaseRef+\"..HEAD\" for the range"}`
+	regressed := "package x\nfunc f() string {\n\treturn \"master..HEAD\"\n}\n"
+	repoA, keyA := writeLocalWorkspaceBrainRepo(t, env, session, "pkg/review_context.go", regressed)
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos:         []workspaceRepo{{RepoKey: keyA, Name: "a", LocalPathHint: repoA}},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	// Text mode (no --json): must render the summary, the per-repo freshness label, and the finding.
+	out, err := execute(t, cmd, "workspace", "review", "related", "fix scopeBaseRef base scope")
+	if err != nil {
+		t.Fatalf("workspace review (text): %v", err)
+	}
+	for _, want := range []string{"Cross-repo diff-less review:", keyA, "[", "Suspected regression", "review_context.go"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("text review output missing %q:\n%s", want, out)
+		}
+	}
+	// Sessions-only brain → "missing-brain" freshness, but a finding still renders; the warning must
+	// be the accurate "scanned raw sessions only" form, not a misleading "nothing to compare".
+	if strings.Contains(out, "nothing to compare") {
+		t.Fatalf("misleading missing-brain warning surfaced despite a real finding:\n%s", out)
+	}
+}
+
+func TestWorkspaceRegressionsAggregatesAndToleratesMissingBrain(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+
+	session := `{"text":"in pkg/review_context.go the scope diff uses scopeBaseRef+\"..HEAD\" for the range"}`
+	regressed := "package x\nfunc f() string {\n\treturn \"master..HEAD\"\n}\n"
+	repoA, keyA := writeLocalWorkspaceBrainRepo(t, env, session, "pkg/review_context.go", regressed)
+	// A repo registered with a real working tree but NO brain prepped (missing-brain).
+	missingTree := t.TempDir()
+	missingKey := testLocalRepoStorageKey(t, missingTree)
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos: []workspaceRepo{
+			{RepoKey: keyA, Name: "a", LocalPathHint: repoA},
+			{RepoKey: missingKey, Name: "missing", LocalPathHint: missingTree},
+		},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	out, err := execute(t, cmd, "workspace", "inspect", "regressions", "related", "fix scopeBaseRef base scope", "--json", "--location-only")
+	if err != nil {
+		t.Fatalf("workspace regressions: %v", err)
+	}
+	var payload struct {
+		Results []workspaceRegressionResult `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("parse regressions json: %v\n%s", err, out)
+	}
+	byKey := map[string]workspaceRegressionResult{}
+	for _, r := range payload.Results {
+		byKey[r.RepoKey] = r
+	}
+	a := byKey[keyA]
+	if len(a.Anomalies) != 1 || a.Anomalies[0].Kind != "changed" {
+		t.Fatalf("repoa anomalies wrong: %+v", a)
+	}
+	if a.Anomalies[0].Expected != "" || a.Anomalies[0].Current != "" {
+		t.Fatalf("--location-only must blank expected/current: %+v", a.Anomalies[0])
+	}
+	// The missing-brain repo must not abort the run; it just yields no anomalies.
+	m, ok := byKey[missingKey]
+	if !ok {
+		t.Fatalf("missing-brain repo omitted from results: %v", byKey)
+	}
+	if len(m.Anomalies) != 0 {
+		t.Fatalf("missing-brain repo should yield no anomalies: %+v", m)
+	}
+}
+
+func TestWorkspaceRegressionsDeletionLocationOnlyReportsRelatedLoci(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+
+	session := `{"text":"pkg/resolve.go must set state.TranscriptPath = resolved so later reads work"}`
+	body := "package x\nfunc missOne(state *State) string {\n\tresolved := compute()\n\t_ = state.TranscriptPath\n\treturn resolved\n}\nfunc missTwo(state *State) string {\n\tresolved := compute()\n\t_ = state.TranscriptPath\n\treturn resolved\n}\n"
+	repoA, keyA := writeLocalWorkspaceBrainRepo(t, env, session, "pkg/resolve.go", body)
+	if err := writeWorkspaceManifest(env, workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos:         []workspaceRepo{{RepoKey: keyA, Name: "a", LocalPathHint: repoA}},
+	}); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	out, err := execute(t, cmd, "workspace", "inspect", "regressions", "related", "fix TranscriptPath resolved", "--json", "--include-deletions", "--location-only")
+	if err != nil {
+		t.Fatalf("workspace regressions: %v", err)
+	}
+	var payload struct {
+		Results []workspaceRegressionResult `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("parse regressions json: %v\n%s", err, out)
+	}
+	if len(payload.Results) != 1 {
+		t.Fatalf("results = %d, want 1: %s", len(payload.Results), out)
+	}
+	result := payload.Results[0]
+	if result.RepoKey != keyA {
+		t.Fatalf("repo key = %q, want %q", result.RepoKey, keyA)
+	}
+	if len(result.Anomalies) != 2 {
+		t.Fatalf("anomalies = %d, want 2: %+v", len(result.Anomalies), result.Anomalies)
+	}
+	bySymbol := map[string]regressionAnomaly{}
+	for _, a := range result.Anomalies {
+		if a.Expected != "" || a.Current != "" {
+			t.Fatalf("--location-only must blank expected/current: %+v", a)
+		}
+		bySymbol[a.Symbol] = a
+	}
+	for _, sym := range []string{"missOne", "missTwo"} {
+		a, ok := bySymbol[sym]
+		if !ok {
+			t.Fatalf("missing %s anomaly: %+v", sym, result.Anomalies)
+		}
+		if len(a.RelatedLocations) == 0 {
+			t.Fatalf("%s missing related location peer: %+v", sym, a)
+		}
+	}
+	if !strings.Contains(strings.Join(bySymbol["missOne"].RelatedLocations, "\n"), "missTwo") ||
+		!strings.Contains(strings.Join(bySymbol["missTwo"].RelatedLocations, "\n"), "missOne") {
+		t.Fatalf("related locations did not preserve both loci: %+v", result.Anomalies)
+	}
+}
+
+func TestWorkspaceFreshnessBlocksScan(t *testing.T) {
+	// Only an untrusted brain<->tree pairing (PairingUnsafe) blocks the scan. State alone does NOT —
+	// a stale/broken semantic index (even State "unsafe") over a valid pairing is still scannable
+	// from raw sessions, and blocking it would drop real findings.
+	for _, st := range []string{"ok", "degraded", "missing-brain", "missing-semantic", "unknown", "unsafe", ""} {
+		if workspaceFreshnessBlocksScan(workspaceRepoFreshness{State: st}) {
+			t.Errorf("state %q without PairingUnsafe should NOT block the scan", st)
+		}
+	}
+	if !workspaceFreshnessBlocksScan(workspaceRepoFreshness{State: "unsafe", PairingUnsafe: true}) {
+		t.Error("PairingUnsafe must block the scan")
+	}
+}
+
+func TestWorkspaceRegressionsSkipsUnsafeRepo(t *testing.T) {
+	// A stale local_path_hint whose repo_key no longer matches the registered key means the brain
+	// (by key) and the tree (by hint) can't be trusted to match — scanning would compare one repo's
+	// memory against an unrelated tree and manufacture bogus regressions. The scan must be skipped.
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	if _, err := execute(t, cmd, "refresh", "index", "--graph-binary", "entire"); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	// Seed a session asserting the invariant + a regressed working tree, so a scan WOULD fire.
+	brainDir := filepath.Join(env.PluginDataDir, repoStoreDirName, "gh", "example", "repo")
+	if err := os.MkdirAll(filepath.Join(brainDir, "sessions"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(brainDir, "sessions", "s.jsonl"),
+		[]byte(`{"text":"in pkg/review_context.go the scope diff uses scopeBaseRef+\"..HEAD\""}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoDir, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "pkg", "review_context.go"),
+		[]byte("package x\nfunc f() string {\n\treturn \"master..HEAD\"\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos:         []workspaceRepo{{RepoKey: "gh/example/repo", Name: "api", LocalPathHint: repoDir}},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+	// Flip the remote so the hint's repo_key no longer matches the registered key -> unsafe.
+	runner.responses[fakeCommandKey("git", "remote", "get-url", "origin")] = fakeCommandResponse{stdout: "git@github.com:other/repo.git\n"}
+
+	out, err := execute(t, cmd, "workspace", "inspect", "regressions", "related", "fix scopeBaseRef base scope", "--json")
+	if err != nil {
+		t.Fatalf("workspace regressions: %v", err)
+	}
+	var payload struct {
+		Results []workspaceRegressionResult `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("parse json: %v\n%s", err, out)
+	}
+	if len(payload.Results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(payload.Results))
+	}
+	r := payload.Results[0]
+	if len(r.Anomalies) != 0 {
+		t.Fatalf("unsafe repo must be skipped (no anomalies despite a real regression), got %+v", r.Anomalies)
+	}
+	if !strings.Contains(r.Error, "unsafe") {
+		t.Fatalf("expected an unsafe-skip error, got %q", r.Error)
+	}
+
+	// Text output must also surface the unsafe state + skip, and must NOT print a bogus finding.
+	// Use a fresh command: cobra flag state (--json) persists on a reused root command.
+	textCmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	textOut, err := execute(t, textCmd, "workspace", "inspect", "regressions", "related", "fix scopeBaseRef base scope")
+	if err != nil {
+		t.Fatalf("workspace regressions (text): %v", err)
+	}
+	if !strings.Contains(textOut, "[unsafe]") || !strings.Contains(textOut, "skipped (unsafe)") {
+		t.Fatalf("text output must surface unsafe freshness + skip:\n%s", textOut)
+	}
+	if strings.Contains(textOut, "review_context.go") {
+		t.Fatalf("unsafe repo must not emit a finding in text:\n%s", textOut)
+	}
+}
+
+func TestWorkspaceRegressionsSkipsUnsafeSessionsOnlyRepo(t *testing.T) {
+	// Sessions-only brains have no export manifest, but they still must validate
+	// the workspace brain<->tree pairing before scanning raw session history.
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+
+	brainDir := filepath.Join(env.PluginDataDir, repoStoreDirName, "gh", "example", "repo")
+	if err := os.MkdirAll(filepath.Join(brainDir, "sessions"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(brainDir, "sessions", "s.jsonl"),
+		[]byte(`{"text":"in pkg/review_context.go the scope diff uses scopeBaseRef+\"..HEAD\""}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoDir, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "pkg", "review_context.go"),
+		[]byte("package x\nfunc f() string {\n\treturn \"master..HEAD\"\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos:         []workspaceRepo{{RepoKey: "gh/example/repo", Name: "api", LocalPathHint: repoDir}},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+	runner.responses[fakeCommandKey("git", "remote", "get-url", "origin")] = fakeCommandResponse{stdout: "git@github.com:other/repo.git\n"}
+
+	out, err := execute(t, cmd, "workspace", "inspect", "regressions", "related", "fix scopeBaseRef base scope", "--json")
+	if err != nil {
+		t.Fatalf("workspace regressions: %v", err)
+	}
+	var payload struct {
+		Results []workspaceRegressionResult `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("parse json: %v\n%s", err, out)
+	}
+	if len(payload.Results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(payload.Results))
+	}
+	r := payload.Results[0]
+	if len(r.Anomalies) != 0 {
+		t.Fatalf("unsafe sessions-only repo must be skipped, got %+v", r.Anomalies)
+	}
+	if !strings.Contains(r.Error, "unsafe") || !strings.Contains(r.Error, "local_path_hint repo_key mismatch") {
+		t.Fatalf("expected unsafe repo-key mismatch error, got %q", r.Error)
+	}
+}
+
+func TestWorkspaceRegressionsSkipsUnverifiableRemoteKeyHint(t *testing.T) {
+	// A registered remote-key brain cannot be safely paired with a local_path_hint whose repo key
+	// falls back to local/<hash>. That is unverifiable, not "probably fine"; scanning it could
+	// compare one repo's memory against an unrelated local tree.
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{
+		fakeCommandKey("git", "remote", "get-url", "origin"): {stdout: "not a parseable remote\n"},
+	}}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+
+	brainDir := filepath.Join(env.PluginDataDir, repoStoreDirName, "gh", "example", "repo")
+	if err := os.MkdirAll(filepath.Join(brainDir, "sessions"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(brainDir, "sessions", "s.jsonl"),
+		[]byte(`{"text":"in pkg/review_context.go the scope diff uses scopeBaseRef+\"..HEAD\""}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoDir, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "pkg", "review_context.go"),
+		[]byte("package x\nfunc f() string {\n\treturn \"master..HEAD\"\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeWorkspaceManifest(env, workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos:         []workspaceRepo{{RepoKey: "gh/example/repo", Name: "api", LocalPathHint: repoDir}},
+	}); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	out, err := execute(t, cmd, "workspace", "inspect", "regressions", "related", "fix scopeBaseRef base scope", "--json")
+	if err != nil {
+		t.Fatalf("workspace regressions: %v", err)
+	}
+	var payload struct {
+		Results []workspaceRegressionResult `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("parse json: %v\n%s", err, out)
+	}
+	if len(payload.Results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(payload.Results))
+	}
+	r := payload.Results[0]
+	if len(r.Anomalies) != 0 {
+		t.Fatalf("unverifiable remote-key hint must be skipped, got %+v", r.Anomalies)
+	}
+	if !strings.Contains(r.Error, "unsafe") || !strings.Contains(r.Error, "local_path_hint repo_key mismatch: local/") {
+		t.Fatalf("expected unsafe local fallback mismatch error, got %q", r.Error)
+	}
+}
+
+func TestWorkspaceFreshnessWarning(t *testing.T) {
+	if workspaceFreshnessWarning(workspaceRepoFreshness{State: "ok"}) != "" {
+		t.Error("ok freshness should not warn")
+	}
+	// A scanned repo with a non-ideal state gets a loud warning. "unsafe" here means a stale/broken
+	// index over a still-valid pairing (a genuine pairing block sets PairingUnsafe and never reaches
+	// this warning path), so it warns "scanned raw sessions only" rather than being silent.
+	for _, st := range []string{"degraded", "missing-brain", "missing-semantic", "unknown", "unsafe"} {
+		if workspaceFreshnessWarning(workspaceRepoFreshness{State: st}) == "" {
+			t.Errorf("state %q should produce a loud warning", st)
+		}
+	}
+}
+
+func TestWorkspaceListAndRemove(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+
+	repoA, keyA := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "a.go", "package x\n")
+	keyB := "gh/example/repob"
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos: []workspaceRepo{
+			{RepoKey: keyA, Name: "a", LocalPathHint: repoA},
+			{RepoKey: keyB, Name: "b", LocalPathHint: repoA},
+		},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	listOut, err := execute(t, cmd, "workspace", "list", "--json")
+	if err != nil {
+		t.Fatalf("workspace list: %v", err)
+	}
+	if !strings.Contains(listOut, `"name": "related"`) || !strings.Contains(listOut, `"repos": 2`) {
+		t.Fatalf("list output = %s", listOut)
+	}
+
+	if _, err := execute(t, cmd, "workspace", "remove", "related", keyB); err != nil {
+		t.Fatalf("workspace remove repo: %v", err)
+	}
+	reloaded, err := loadWorkspaceManifest(env, "related")
+	if err != nil {
+		t.Fatalf("load workspace: %v", err)
+	}
+	if len(reloaded.Repos) != 1 || reloaded.Repos[0].RepoKey != keyA {
+		t.Fatalf("repo not removed: %+v", reloaded.Repos)
+	}
+
+	// Removing a repo that is not present is an error.
+	if _, err := execute(t, cmd, "workspace", "remove", "related", "gh/example/nope"); err == nil {
+		t.Fatalf("remove of absent repo should error")
+	}
+
+	// Removing the whole workspace deletes it.
+	if _, err := execute(t, cmd, "workspace", "remove", "related"); err != nil {
+		t.Fatalf("workspace remove all: %v", err)
+	}
+	if _, err := loadWorkspaceManifest(env, "related"); err == nil {
+		t.Fatalf("workspace should be gone")
+	}
+}
+
+func TestWorkspaceRefreshReportsMissingBrains(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "payments-platform",
+		Repos:         []workspaceRepo{{RepoKey: "gh/example/missing", Name: "missing"}},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}, Now: time.Now})
+	out, err := execute(t, cmd, "workspace", "refresh", "payments-platform")
+	if err != nil {
+		t.Fatalf("workspace refresh: %v", err)
+	}
+	if !strings.Contains(out, "gh/example/missing missing-brain") {
+		t.Fatalf("refresh output = %q", out)
+	}
+}
+
+func writeWorkspaceDocIndex(t *testing.T, env EntireEnv, key string, records ...docRecord) {
+	t.Helper()
+	brainDir := filepath.Join(env.PluginDataDir, repoStoreDirName, filepath.FromSlash(key))
+	if err := os.MkdirAll(filepath.Join(brainDir, docDirName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(docIndex{Records: records})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(brainDir, filepath.FromSlash(docIndexPath)), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkspaceSearchAndGetFanOutWithQualifiedIDs(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+
+	_, keyA := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "a.go", "package x\n")
+	_, keyB := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "b.go", "package x\n")
+	writeWorkspaceDocIndex(t, env, keyA, docRecord{ID: "guide", Path: "docs/guide.md", Line: 1, Text: "checkout flow retries twice before failing"})
+	writeWorkspaceDocIndex(t, env, keyB, docRecord{ID: "other", Path: "docs/other.md", Line: 1, Text: "billing ledger reconciliation"})
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos:         []workspaceRepo{{RepoKey: keyA, Name: "a"}, {RepoKey: keyB, Name: "b"}},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+
+	searchOut, err := execute(t, cmd, "workspace", "search", "related", "checkout", "--json")
+	if err != nil {
+		t.Fatalf("workspace search: %v", err)
+	}
+	if !strings.Contains(searchOut, `"id": "`+keyA+`/doc:guide"`) {
+		t.Fatalf("search output missing doc hit from repo A:\n%s", searchOut)
+	}
+	// Results stay grouped per repo: repo B has no "checkout" hit, but its group
+	// (with an empty results array) is still present.
+	if !strings.Contains(searchOut, `"repo_key": "`+keyB+`"`) {
+		t.Fatalf("search output missing repo B group:\n%s", searchOut)
+	}
+	if strings.Contains(searchOut, `"id": "`+keyB+`/doc:other"`) {
+		t.Fatalf("search output leaked repo B's unrelated doc:\n%s", searchOut)
+	}
+
+	for _, args := range [][]string{
+		{"workspace", "query", "related", "--keyword", "--query", "checkout", "--json"},
+		{"workspace", "query", "--query", "checkout", "related", "--keyword", "--json"},
+		{"workspace", "query", "--keyword", "related", "checkout", "--json"},
+	} {
+		root := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+		out, err := execute(t, root, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != searchOut {
+			t.Fatalf("workspace query keyword differs from search: %s / %s", out, searchOut)
+		}
+	}
+
+	// Text mode prints repo-qualified ids so they can be pasted into `workspace get`.
+	// Fresh root command: cobra flag values (--json) stick across executions.
+	textCmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	textOut, err := execute(t, textCmd, "workspace", "search", "related", "checkout")
+	if err != nil {
+		t.Fatalf("workspace search (text): %v", err)
+	}
+	if !strings.Contains(textOut, keyA+"/doc:guide") {
+		t.Fatalf("text output missing qualified id %s/doc:guide:\n%s", keyA, textOut)
+	}
+
+	// The hybrid verb shares the same fan-out; without an embedder it degrades to
+	// the lexical arms and must still return the doc hit.
+	queryOut, err := execute(t, cmd, "workspace", "query", "related", "checkout", "--json")
+	if err != nil {
+		t.Fatalf("workspace query: %v", err)
+	}
+	if !strings.Contains(queryOut, `"id": "`+keyA+`/doc:guide"`) {
+		t.Fatalf("query output missing doc hit:\n%s", queryOut)
+	}
+
+	getOut, err := execute(t, cmd, "workspace", "get", "related", keyA+"/doc:guide", keyB+"/doc:nope", "--json")
+	if err != nil {
+		t.Fatalf("workspace get: %v", err)
+	}
+	if !strings.Contains(getOut, "checkout flow retries twice before failing") {
+		t.Fatalf("get output missing full doc text:\n%s", getOut)
+	}
+	if !strings.Contains(getOut, `"`+keyB+`/doc:nope"`) {
+		t.Fatalf("get output missing re-qualified missing id:\n%s", getOut)
+	}
+
+	if _, err := execute(t, cmd, "workspace", "get", "related", "local/notamember/doc:x"); err == nil || !strings.Contains(err.Error(), "not a member") {
+		t.Fatalf("expected non-member error, got %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "get", "related", "doc:guide"); err == nil || !strings.Contains(err.Error(), "missing its repo key") {
+		t.Fatalf("expected unqualified-id error, got %v", err)
+	}
+}
+
+func TestWorkspaceSearchAndGetIncludesPersistedGraphEdges(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	opts := Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now}
+	cmd := NewRootCommand(opts)
+
+	_, keyA := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "client.ts", "export function fetchViewer() {}\n")
+	_, keyB := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "schema.graphql", "type Query { viewer: User }\n")
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos:         []workspaceRepo{{RepoKey: keyA, Name: "client"}, {RepoKey: keyB, Name: "api"}},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatalf("write workspace: %v", err)
+	}
+	edge := workspaceGraphCrossEdge{
+		Endpoint:     "external:graphql:query viewer",
+		Type:         "graphql",
+		FromRepo:     keyA,
+		ToRepo:       keyB,
+		FromSymbol:   workspaceGraphSymbolRef{RepoKey: keyA, ID: "symbol:client.fetchViewer", Kind: "function", Name: "fetchViewer", QualifiedName: "client.fetchViewer", FilePath: "client.ts"},
+		ToSymbol:     workspaceGraphSymbolRef{RepoKey: keyB, ID: "symbol:Query.viewer", Kind: "field", Name: "viewer", QualifiedName: "Query.viewer", FilePath: "schema.graphql"},
+		SharedCount:  1,
+		RelationKind: "cross_repo_graphql_call",
+	}
+	if _, err := writeWorkspaceGraphPayload(env, workspaceGraphPayload{
+		Generation:  workspaceGraphTestGeneration(t, env, manifest),
+		Workspace:   manifest.Name,
+		GeneratedAt: time.Now(),
+		CrossEdges:  []workspaceGraphCrossEdge{edge},
+	}); err != nil {
+		t.Fatalf("write workspace graph: %v", err)
+	}
+
+	searchOut, err := execute(t, cmd, "workspace", "search", "related", "viewer graphql", "--json")
+	if err != nil {
+		t.Fatalf("workspace search: %v", err)
+	}
+	graphID := workspaceGraphCrossEdgeID(edge)
+	for _, want := range []string{`"source": "workspace_graph"`, `"id": "` + graphID + `"`, "cross_repo_graphql_call", "external:graphql:query viewer"} {
+		if !strings.Contains(searchOut, want) {
+			t.Fatalf("search output missing %q:\n%s", want, searchOut)
+		}
+	}
+
+	queryOut, err := execute(t, cmd, "workspace", "query", "related", "viewer graphql", "--json")
+	if err != nil {
+		t.Fatalf("workspace query: %v", err)
+	}
+	if !strings.Contains(queryOut, `"id": "`+graphID+`"`) {
+		t.Fatalf("query output missing workspace graph hit:\n%s", queryOut)
+	}
+
+	textCmd := NewRootCommand(opts)
+	textOut, err := execute(t, textCmd, "workspace", "search", "related", "viewer graphql")
+	if err != nil {
+		t.Fatalf("workspace search text: %v", err)
+	}
+	if !strings.Contains(textOut, "[workspace_graph] "+graphID) {
+		t.Fatalf("text output missing pasteable graph id %s:\n%s", graphID, textOut)
+	}
+
+	getOut, err := execute(t, cmd, "workspace", "get", "related", graphID, "--json")
+	if err != nil {
+		t.Fatalf("workspace get: %v", err)
+	}
+	for _, want := range []string{`"source": "workspace_graph"`, "client.fetchViewer", "Query.viewer", "schema.graphql"} {
+		if !strings.Contains(getOut, want) {
+			t.Fatalf("get output missing %q:\n%s", want, getOut)
+		}
+	}
+}
+
+func TestSplitWorkspaceID(t *testing.T) {
+	cases := []struct {
+		in      string
+		repoKey string
+		id      string
+		wantErr bool
+	}{
+		{in: "gh/owner/repo/fact:abc", repoKey: "gh/owner/repo", id: "fact:abc"},
+		{in: "gh/owner/repo/review:abc", repoKey: "gh/owner/repo", id: "review:abc"},
+		{in: "local/abc123/history:h1", repoKey: "local/abc123", id: "history:h1"},
+		{in: "gh/owner/repo/doc:guide", repoKey: "gh/owner/repo", id: "doc:guide"},
+		{in: "fact:abc", wantErr: true},      // unqualified
+		{in: "gh/owner/repo", wantErr: true}, // no id
+		{in: "gh/owner/repo/note:x", wantErr: true},
+	}
+	for _, tc := range cases {
+		repoKey, id, err := splitWorkspaceID(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("splitWorkspaceID(%q): expected error, got %q %q", tc.in, repoKey, id)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("splitWorkspaceID(%q): %v", tc.in, err)
+			continue
+		}
+		if repoKey != tc.repoKey || id != tc.id {
+			t.Errorf("splitWorkspaceID(%q) = %q, %q; want %q, %q", tc.in, repoKey, id, tc.repoKey, tc.id)
+		}
+	}
+}
+
+func TestWorkspaceFullRefreshGatesAndCarriesPerMemberFailures(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	opts := Options{Version: "test", Env: env, Runner: runner, Now: time.Now}
+	repoGood, keyGood := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "a.go", "package x\n")
+	repoBad, keyBad := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "b.go", "package x\n")
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "related",
+		Repos: []workspaceRepo{
+			{RepoKey: keyGood, LocalPathHint: repoGood},
+			{RepoKey: keyBad, LocalPathHint: repoBad},
+			{RepoKey: "gh/example/nohint"}, // no local_path_hint: must be gated out, not refreshed
+		},
+	}
+
+	var refreshed []string
+	out := &bytes.Buffer{}
+	err := workspaceFullRefresh(context.Background(), out, opts, manifest, func(repoDir string) error {
+		refreshed = append(refreshed, repoDir)
+		if repoDir == repoBad {
+			return errors.New("boom")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("workspaceFullRefresh: %v", err)
+	}
+	if len(refreshed) != 2 || refreshed[0] != repoGood || refreshed[1] != repoBad {
+		t.Fatalf("expected refresh attempts on both local members, got %v", refreshed)
+	}
+	got := out.String()
+	if !strings.Contains(got, keyGood+" refreshed") {
+		t.Fatalf("missing success line for %s:\n%s", keyGood, got)
+	}
+	// A failing member is reported and must not abort the fan-out.
+	if !strings.Contains(got, keyBad+" refresh failed: boom") {
+		t.Fatalf("missing failure line for %s:\n%s", keyBad, got)
+	}
+	if !strings.Contains(got, "gh/example/nohint skipped (no resolvable local path)") {
+		t.Fatalf("missing identity-gate skip line:\n%s", got)
+	}
+}
+
+// TestWorkspaceConversationRecallFanOut is Phase 5's conversation increment:
+// the conversation source fans out across member brains with per-repo
+// grouping, the historical-evidence contract, filter support, namespace
+// isolation, and repo-qualified get expansion (the explicit cross-repo step).
+func TestWorkspaceConversationRecallFanOut(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: func() time.Time { return now }})
+
+	_, keyA := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "a.go", "package x\n")
+	_, keyB := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "b.go", "package x\n")
+
+	// Member A gets a captured conversation about a deploy rollback; member B
+	// one about billing. Each member brain indexes its own sessions.
+	writeMemberConversation := func(key, sessionID, request, response string) {
+		t.Helper()
+		brainDir := filepath.Join(env.PluginDataDir, repoStoreDirName, filepath.FromSlash(key))
+		rel := "sessions/main/20260808T100000Z_" + sessionID + ".jsonl"
+		body := `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"` + request + `"}]}}` + "\n" +
+			`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + response + `"}]}}` + "\n"
+		full := filepath.Join(brainDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		manifest, err := loadBrainManifest(brainDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if manifest.Sources == nil {
+			manifest.Sources = &brainSources{}
+		}
+		if manifest.Sources.Sessions == nil {
+			manifest.Sources.Sessions = &sessionSourceManifest{GeneratedAt: now, DefaultBranch: "main"}
+		}
+		manifest.RepoKey = key
+		manifest.Sources.Sessions.Sessions = append(manifest.Sources.Sessions.Sessions, exportSession{
+			SessionID: sessionID, Branch: "main", Agent: "Claude Code", LatestCheckpoint: "cp",
+			TranscriptPath: rel, CreatedAt: now.Add(-time.Hour),
+		})
+		if err := writeBrainManifestAndReadme(brainDir, *manifest); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeBrainHistoryIndexAndSource(brainDir, now, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeMemberConversation(keyA, "sess-a", "why did the deploy rollback loop", "Decision: the rollback loop came from a stale health probe; pinned the probe version.")
+	writeMemberConversation(keyB, "sess-b", "reconcile the billing ledger", "Decision: ledger drift came from double-posted credits.")
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "convspace",
+		Repos:         []workspaceRepo{{RepoKey: keyA, Name: "a"}, {RepoKey: keyB, Name: "b"}},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	searchOut, err := execute(t, cmd, "workspace", "search", "convspace", "deploy rollback loop", "--source", "conversation", "--json")
+	if err != nil {
+		t.Fatalf("workspace conversation search: %v", err)
+	}
+	if !strings.Contains(searchOut, "stale health probe") {
+		t.Fatalf("missing member A conversation hit:\n%s", searchOut)
+	}
+	if strings.Contains(searchOut, "billing ledger") {
+		t.Fatalf("member B's unrelated conversation leaked:\n%s", searchOut)
+	}
+	if !strings.Contains(searchOut, `"repo_key": "`+keyA+`"`) || !strings.Contains(searchOut, `"repo_key": "`+keyB+`"`) {
+		t.Fatalf("results not grouped by repo identity:\n%s", searchOut)
+	}
+	if !strings.Contains(searchOut, `"historical_conversation"`) || !strings.Contains(searchOut, `"verification_required": true`) {
+		t.Fatalf("historical-evidence contract missing in workspace fan-out:\n%s", searchOut)
+	}
+	// Source isolation per member: no fact/doc/history record in a
+	// conversation-scoped fan-out.
+	if strings.Contains(searchOut, `"source": "doc"`) || strings.Contains(searchOut, `"source": "history"`) {
+		t.Fatalf("non-conversation source leaked:\n%s", searchOut)
+	}
+
+	// Filters flow through the shared contract; a wrong-source filter is one
+	// structured error before the fan-out. Fresh root command: cobra flag
+	// values stick across executions.
+	badCmd := NewRootCommand(Options{Version: "t", Env: env, Runner: runner, Now: func() time.Time { return now }})
+	if _, err := execute(t, badCmd, "workspace", "search", "convspace", "deploy", "--agent", "Claude Code"); err == nil {
+		t.Fatal("agent filter without conversation source must error")
+	}
+	filtered, err := execute(t, NewRootCommand(Options{Version: "t", Env: env, Runner: runner, Now: func() time.Time { return now }}),
+		"workspace", "search", "convspace", "deploy rollback loop", "--source", "conversation", "--agent", "Codex", "--json")
+	if err != nil {
+		t.Fatalf("filtered search: %v", err)
+	}
+	if strings.Contains(filtered, "stale health probe") {
+		t.Fatalf("agent filter did not exclude Claude Code sessions:\n%s", filtered)
+	}
+
+	// Explicit cross-repo expansion: extract the conversation id and get it
+	// repo-qualified; an unqualified id stays rejected (tested in the base
+	// workspace test).
+	var payload struct {
+		Results []struct {
+			RepoKey string `json:"repo_key"`
+			Results []struct {
+				ID string `json:"id"`
+			} `json:"results"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(searchOut), &payload); err != nil {
+		t.Fatal(err)
+	}
+	var convID string
+	for _, group := range payload.Results {
+		if group.RepoKey == keyA && len(group.Results) > 0 {
+			convID = group.Results[0].ID
+		}
+	}
+	if !strings.HasPrefix(convID, keyA+"/conversation:") {
+		t.Fatalf("no conversation id in repo A group: %+v", payload.Results)
+	}
+	getOut, err := execute(t, cmd, "workspace", "get", "convspace", convID, "--json")
+	if err != nil {
+		t.Fatalf("workspace get conversation: %v", err)
+	}
+	if !strings.Contains(getOut, "pinned the probe version") {
+		t.Fatalf("qualified conversation get missing expansion:\n%s", getOut)
+	}
+	if !strings.Contains(getOut, `"historical_conversation"`) {
+		t.Fatalf("expansion missing caveat:\n%s", getOut)
+	}
+}
+
+// Workspace source-isolation fixture: a workspace holding both graph matches and
+// conversation matches for the same query must keep source=conversation
+// results conversation-only, and the branch filter must reach every member
+// brain in the fan-out.
+func TestWorkspaceConversationSourceIsolationAndBranchPropagation(t *testing.T) {
+	env := semanticTestEnv(t, t.TempDir())
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	opts := Options{Version: "test-version", Env: env, Runner: runner, Now: func() time.Time { return now }}
+
+	_, keyA := writeLocalWorkspaceBrainRepo(t, env, `{"text":"x"}`, "a.go", "package x\n")
+
+	writeMemberConversation := func(key, sessionID, request, response string) {
+		t.Helper()
+		brainDir := filepath.Join(env.PluginDataDir, repoStoreDirName, filepath.FromSlash(key))
+		rel := "sessions/main/20260808T100000Z_" + sessionID + ".jsonl"
+		body := `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"` + request + `"}]}}` + "\n" +
+			`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"` + response + `"}]}}` + "\n"
+		full := filepath.Join(brainDir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		manifest, err := loadBrainManifest(brainDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if manifest.Sources == nil {
+			manifest.Sources = &brainSources{}
+		}
+		if manifest.Sources.Sessions == nil {
+			manifest.Sources.Sessions = &sessionSourceManifest{GeneratedAt: now, DefaultBranch: "main"}
+		}
+		manifest.RepoKey = key
+		manifest.Sources.Sessions.Sessions = append(manifest.Sources.Sessions.Sessions, exportSession{
+			SessionID: sessionID, Branch: "main", Agent: "Claude Code", LatestCheckpoint: "cp",
+			TranscriptPath: rel, CreatedAt: now.Add(-time.Hour),
+		})
+		if err := writeBrainManifestAndReadme(brainDir, *manifest); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeBrainHistoryIndexAndSource(brainDir, now, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeMemberConversation(keyA, "sess-a", "why did the deploy rollback loop", "Decision: the rollback loop came from a stale health probe; pinned the probe version.")
+
+	manifest := workspaceManifest{
+		SchemaVersion: workspaceSchemaVersion,
+		Name:          "isospace",
+		Repos:         []workspaceRepo{{RepoKey: keyA, Name: "a"}},
+	}
+	if err := writeWorkspaceManifest(env, manifest); err != nil {
+		t.Fatal(err)
+	}
+	// A persisted graph edge whose text matches the same query terms.
+	edge := workspaceGraphCrossEdge{
+		Endpoint:     "external:deploy:rollback",
+		Type:         "http",
+		FromRepo:     keyA,
+		ToRepo:       keyA,
+		FromSymbol:   workspaceGraphSymbolRef{RepoKey: keyA, ID: "symbol:deployRollback", Kind: "function", Name: "deployRollback", QualifiedName: "ops.deployRollback", FilePath: "a.go"},
+		ToSymbol:     workspaceGraphSymbolRef{RepoKey: keyA, ID: "symbol:rollbackLoop", Kind: "function", Name: "rollbackLoop", QualifiedName: "ops.rollbackLoop", FilePath: "a.go"},
+		SharedCount:  1,
+		RelationKind: "cross_repo_http_call",
+	}
+	if _, err := writeWorkspaceGraphPayload(env, workspaceGraphPayload{
+		Generation:  workspaceGraphTestGeneration(t, env, manifest),
+		Workspace:   manifest.Name,
+		GeneratedAt: now,
+		CrossEdges:  []workspaceGraphCrossEdge{edge},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Source isolation: conversation-scoped search must not append the
+	// workspace-graph group even though the edge matches the query.
+	convOut, err := execute(t, NewRootCommand(opts), "workspace", "search", "isospace", "deploy rollback loop", "--source", "conversation", "--json")
+	if err != nil {
+		t.Fatalf("conversation search: %v", err)
+	}
+	if !strings.Contains(convOut, "stale health probe") {
+		t.Fatalf("missing conversation hit:\n%s", convOut)
+	}
+	if strings.Contains(convOut, `"source": "workspace_graph"`) {
+		t.Fatalf("workspace graph leaked into source=conversation results:\n%s", convOut)
+	}
+
+	// Any explicit single source keeps the same isolation.
+	histOut, err := execute(t, NewRootCommand(opts), "workspace", "search", "isospace", "deploy rollback loop", "--source", "history", "--json")
+	if err != nil {
+		t.Fatalf("history search: %v", err)
+	}
+	if strings.Contains(histOut, `"source": "workspace_graph"`) {
+		t.Fatalf("workspace graph leaked into source=history results:\n%s", histOut)
+	}
+
+	// Default source keeps the graph group (existing behavior).
+	allOut, err := execute(t, NewRootCommand(opts), "workspace", "search", "isospace", "deploy rollback loop", "--json")
+	if err != nil {
+		t.Fatalf("default search: %v", err)
+	}
+	if !strings.Contains(allOut, `"source": "workspace_graph"`) {
+		t.Fatalf("default-source search lost the workspace graph group:\n%s", allOut)
+	}
+
+	// Branch propagation: the captured branch is main, so a release-branch
+	// filter must exclude the exchange in every member, and a main filter must
+	// keep it.
+	missOut, err := execute(t, NewRootCommand(opts), "workspace", "search", "isospace", "deploy rollback loop", "--source", "conversation", "--branch", "release", "--json")
+	if err != nil {
+		t.Fatalf("branch-filtered search: %v", err)
+	}
+	if strings.Contains(missOut, "stale health probe") {
+		t.Fatalf("branch filter did not reach the member fan-out:\n%s", missOut)
+	}
+	hitOut, err := execute(t, NewRootCommand(opts), "workspace", "search", "isospace", "deploy rollback loop", "--source", "conversation", "--branch", "main", "--json")
+	if err != nil {
+		t.Fatalf("branch-matched search: %v", err)
+	}
+	if !strings.Contains(hitOut, "stale health probe") {
+		t.Fatalf("matching branch filter dropped the exchange:\n%s", hitOut)
+	}
+}
+
+// workspaceManifestRepos reads back what `workspace add` actually registered,
+// which is the half of the bug the exit code hid: the refusal has to happen
+// before the member row exists, not after.
+func workspaceManifestRepos(t *testing.T, env EntireEnv, workspace string) []workspaceRepo {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(env.PluginDataDir, workspaceDirName, workspace, workspaceManifestName))
+	if err != nil {
+		t.Fatalf("read workspace: %v", err)
+	}
+	var manifest workspaceManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("parse workspace: %v", err)
+	}
+	return manifest.Repos
+}
+
+// TestWorkspaceAddRefusesAPathThatIsNotARepository pins the check `workspace
+// add` never made. It tested for EXISTENCE, and a regular file exists, so
+// `workspace add ws /etc/passwd` rewrote the file to its parent directory,
+// hashed /etc into a local/ key, printed "added" and exited 0 -- registering a
+// member that can never grow a brain.
+func TestWorkspaceAddRefusesAPathThatIsNotARepository(t *testing.T) {
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	// An empty response map makes every git call fail, which is what
+	// `rev-parse --show-toplevel` does outside a repository.
+	runner := &fakeCommandRunner{responses: map[string]fakeCommandResponse{}}
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err != nil {
+		t.Fatalf("workspace create: %v", err)
+	}
+
+	plainDir := t.TempDir()
+	plainFile := filepath.Join(plainDir, "passwd")
+	if err := os.WriteFile(plainFile, []byte("root:x:0:0:\n"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	for _, target := range []string{plainDir, plainFile} {
+		_, err := execute(t, cmd, "workspace", "add", "payments-platform", target)
+		if err == nil {
+			t.Fatalf("workspace add accepted a non-repository: %s", target)
+		}
+		if !strings.Contains(err.Error(), "not a git repository") {
+			t.Fatalf("the refusal does not name the condition for %s: %v", target, err)
+		}
+		// A file names the directory that was actually checked, so the parent
+		// rewrite is visible rather than silent.
+		if !strings.Contains(err.Error(), plainDir) {
+			t.Fatalf("the refusal does not name the path it checked for %s: %v", target, err)
+		}
+		if !strings.Contains(err.Error(), "git init") {
+			t.Fatalf("the refusal does not name the fix for %s: %v", target, err)
+		}
+	}
+	if repos := workspaceManifestRepos(t, env, "payments-platform"); len(repos) != 0 {
+		t.Fatalf("a refused path was registered anyway: %+v", repos)
+	}
+}
+
+// TestWorkspaceAddStillResolvesAFileInsideARepository keeps the half of the
+// parent-directory rewrite that was always legitimate: naming a file in a repo
+// is a reasonable way to name the repo, and git resolves it to the work-tree
+// root exactly as it resolves a subdirectory. Only the case where the rewrite
+// landed OUTSIDE a repository was ever wrong.
+func TestWorkspaceAddStillResolvesAFileInsideARepository(t *testing.T) {
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err != nil {
+		t.Fatalf("workspace create: %v", err)
+	}
+	readme := filepath.Join(repoDir, "README.md")
+	if err := os.WriteFile(readme, []byte("# api\n"), 0o600); err != nil {
+		t.Fatalf("write readme: %v", err)
+	}
+	if _, err := execute(t, cmd, "workspace", "add", "payments-platform", readme); err != nil {
+		t.Fatalf("workspace add: %v", err)
+	}
+	repos := workspaceManifestRepos(t, env, "payments-platform")
+	if len(repos) != 1 || repos[0].RepoKey != "gh/example/repo" || repos[0].LocalPathHint != repoDir {
+		t.Fatalf("a file inside a repo did not register the repo: %+v", repos)
+	}
+}
+
+// TestWorkspaceAddValidatesTheMemberDisplayName closes the asymmetry inside one
+// command: the workspace name positional was allowlisted, while the --name flag
+// on the same invocation was stored raw, so a 5000-character value and a
+// `../`-laden one both round-tripped into workspace.json and from there,
+// unescaped, into the workspace README.
+func TestWorkspaceAddValidatesTheMemberDisplayName(t *testing.T) {
+	repoDir := t.TempDir()
+	env := semanticTestEnv(t, repoDir)
+	runner := semanticFixtureRunner(repoDir, semanticFixtureSnapshot("1.0"))
+	cmd := NewRootCommand(Options{Version: "test-version", Env: env, Runner: runner, Now: time.Now})
+	if _, err := execute(t, cmd, "workspace", "create", "payments-platform"); err != nil {
+		t.Fatalf("workspace create: %v", err)
+	}
+	for _, name := range []string{
+		strings.Repeat("A", 5000),
+		"../../../etc/passwd",
+		"..",
+		".",
+		"api server",
+		"api/server",
+	} {
+		_, err := execute(t, cmd, "workspace", "add", "payments-platform", repoDir, "--name", name)
+		if err == nil {
+			t.Fatalf("workspace add accepted --name %q", truncateString(name, 40))
+		}
+		if !strings.Contains(err.Error(), "workspace repo name must") {
+			t.Fatalf("the refusal for --name %q does not say what a name may be: %v", truncateString(name, 40), err)
+		}
+		// The refusal must not echo a 5000-character value back at the reader.
+		if len(err.Error()) > 200 {
+			t.Fatalf("the refusal echoed the whole oversized name back: %d bytes", len(err.Error()))
+		}
+	}
+	if repos := workspaceManifestRepos(t, env, "payments-platform"); len(repos) != 0 {
+		t.Fatalf("a refused --name was registered anyway: %+v", repos)
+	}
+	// The names people actually use keep working, including the dots, dashes
+	// and underscores the workspace name allows.
+	for _, name := range []string{"api", "api-gateway", "api_v2.1"} {
+		if _, err := execute(t, cmd, "workspace", "add", "payments-platform", repoDir, "--name", name); err != nil {
+			t.Fatalf("workspace add rejected --name %q: %v", name, err)
+		}
+	}
+}

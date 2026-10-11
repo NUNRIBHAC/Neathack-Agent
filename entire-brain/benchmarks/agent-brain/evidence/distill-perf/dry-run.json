@@ -1,0 +1,594 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-13T21:11:35.328395Z",
+  "brain_path": "/tmp/distill-evidence-data/repos/gh/ashtom/entire-brain",
+  "force": true,
+  "agent": "command",
+  "jobs": 1,
+  "extraction_jobs_cap": 1,
+  "max_chunk_bytes": 262144,
+  "confidence_threshold": 0.75,
+  "sessions": 217,
+  "cached_sessions": 0,
+  "sessions_to_distill": 217,
+  "missing_transcripts": 0,
+  "raw_bytes": 1177089969,
+  "preprocessed_bytes": 19763765,
+  "chunks": 258,
+  "chunks_if_uncached": 258,
+  "extraction_agent_calls": 258,
+  "reconcile_agent_calls_upper_bound": 258,
+  "estimated_agent_calls_upper_bound": 516,
+  "branches": [
+    {
+      "branch": "claude/cc-debug",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 96387
+    },
+    {
+      "branch": "claude/pr49-review-fixes",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 109811
+    },
+    {
+      "branch": "claude/thomas-asks",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 4,
+      "chunks_if_uncached": 4,
+      "preprocessed_bytes": 806422
+    },
+    {
+      "branch": "codex/align-trail-runners",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 36365
+    },
+    {
+      "branch": "codex/benchmark-repair-integration",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 255557
+    },
+    {
+      "branch": "codex/current-main-source-of-truth",
+      "sessions": 2,
+      "cached_sessions": 0,
+      "sessions_to_distill": 2,
+      "chunks": 5,
+      "chunks_if_uncached": 5,
+      "preprocessed_bytes": 876706
+    },
+    {
+      "branch": "codex/full-plan-implementation",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 112704
+    },
+    {
+      "branch": "codex/graph-parser-upgrade",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 53541
+    },
+    {
+      "branch": "codex/pr183-review",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 19304
+    },
+    {
+      "branch": "codex/pr189-review",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 14503
+    },
+    {
+      "branch": "codex/pr89-merge",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 31749
+    },
+    {
+      "branch": "codex/thomas-release-readiness",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 4,
+      "chunks_if_uncached": 4,
+      "preprocessed_bytes": 849723
+    },
+    {
+      "branch": "codex/workstream7-ranking-gate",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 17536
+    },
+    {
+      "branch": "codex/ws2-treatment-isolation",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 29716
+    },
+    {
+      "branch": "codex/ws3-temporal-eligibility",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 18111
+    },
+    {
+      "branch": "codex/ws4-counterbalanced-runtime-controls",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 12303
+    },
+    {
+      "branch": "codex/ws5-evidence-provenance",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 19989
+    },
+    {
+      "branch": "codex/ws6-preregistered-engine-matrix",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 21099
+    },
+    {
+      "branch": "docs/p0m5-install-docs",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 92828
+    },
+    {
+      "branch": "docs/readme-refresh",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 7,
+      "chunks_if_uncached": 7,
+      "preprocessed_bytes": 1574660
+    },
+    {
+      "branch": "feat/adaptive-project-memory-v2",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 19089
+    },
+    {
+      "branch": "feat/brain-setup-onboarding",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 3,
+      "chunks_if_uncached": 3,
+      "preprocessed_bytes": 753746
+    },
+    {
+      "branch": "feat/candidate-distillation-phase2",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 182834
+    },
+    {
+      "branch": "feat/candidate-distillation-phase3",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 182834
+    },
+    {
+      "branch": "feat/candidate-distillation-phase3b",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 246925
+    },
+    {
+      "branch": "feat/candidate-distillation-quality-gate",
+      "sessions": 2,
+      "cached_sessions": 0,
+      "sessions_to_distill": 2,
+      "chunks": 3,
+      "chunks_if_uncached": 3,
+      "preprocessed_bytes": 373269
+    },
+    {
+      "branch": "feat/candidate-first-distillation",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 180905
+    },
+    {
+      "branch": "feat/conversation-request-weighted-embed",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 41514
+    },
+    {
+      "branch": "feat/conversational-memory-phase1",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 5113
+    },
+    {
+      "branch": "feat/conversational-memory-phase2",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 20692
+    },
+    {
+      "branch": "feat/facts-gitmeta-local",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 115478
+    },
+    {
+      "branch": "feat/phase4-tail",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 39860
+    },
+    {
+      "branch": "feat/purge-gitmeta-sync-caveat",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 26907
+    },
+    {
+      "branch": "feat/qmd-retrieval",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 2,
+      "chunks_if_uncached": 2,
+      "preprocessed_bytes": 298305
+    },
+    {
+      "branch": "feat/r0-correctness-repair",
+      "sessions": 2,
+      "cached_sessions": 0,
+      "sessions_to_distill": 2,
+      "chunks": 2,
+      "chunks_if_uncached": 2,
+      "preprocessed_bytes": 139192
+    },
+    {
+      "branch": "feat/short-term-memory",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 38756
+    },
+    {
+      "branch": "feat/stage1a-derived-index",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 55160
+    },
+    {
+      "branch": "feat/stage1b-transformer-embedder",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 145175
+    },
+    {
+      "branch": "feat/temporal-memory-spike",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 32
+    },
+    {
+      "branch": "feat/watch-consolidation-cadence",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 39286
+    },
+    {
+      "branch": "feat/workspace-conversation-recall",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 42252
+    },
+    {
+      "branch": "feat/workspace-dir-home",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 125554
+    },
+    {
+      "branch": "fix/bugbot-review-findings",
+      "sessions": 2,
+      "cached_sessions": 0,
+      "sessions_to_distill": 2,
+      "chunks": 2,
+      "chunks_if_uncached": 2,
+      "preprocessed_bytes": 85228
+    },
+    {
+      "branch": "fix/history-fts-duplicate-ids",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 81389
+    },
+    {
+      "branch": "fix/release-evidence-gate",
+      "sessions": 2,
+      "cached_sessions": 0,
+      "sessions_to_distill": 2,
+      "chunks": 2,
+      "chunks_if_uncached": 2,
+      "preprocessed_bytes": 264743
+    },
+    {
+      "branch": "fix/semantic-completeness-policy-skips",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 104373
+    },
+    {
+      "branch": "harvest/agent-ux-and-embedder-ux",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 86427
+    },
+    {
+      "branch": "main",
+      "sessions": 160,
+      "cached_sessions": 0,
+      "sessions_to_distill": 160,
+      "chunks": 178,
+      "chunks_if_uncached": 178,
+      "preprocessed_bytes": 9213740
+    },
+    {
+      "branch": "p0p1/p1-new",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 3,
+      "chunks_if_uncached": 3,
+      "preprocessed_bytes": 753746
+    },
+    {
+      "branch": "pr35-fixes",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 211823
+    },
+    {
+      "branch": "pr85",
+      "sessions": 1,
+      "cached_sessions": 0,
+      "sessions_to_distill": 1,
+      "chunks": 1,
+      "chunks_if_uncached": 1,
+      "preprocessed_bytes": 114636
+    },
+    {
+      "branch": "wip/memory-lifecycle-plan-handoff-20260712",
+      "sessions": 2,
+      "cached_sessions": 0,
+      "sessions_to_distill": 2,
+      "chunks": 4,
+      "chunks_if_uncached": 4,
+      "preprocessed_bytes": 725768
+    }
+  ],
+  "largest_sessions": [
+    {
+      "session_id": "019eacc8-4c81-7c91-b807-b3c82bbba45d",
+      "branch": "main",
+      "transcript": "sessions/main/20260611T045448Z_codex_019eacc8-4c81-7c91-b807-b3c82bbba45d_4c4529ffc1ee.jsonl",
+      "cached": false,
+      "chunks": 9,
+      "chunks_if_uncached": 9,
+      "raw_bytes": 52428580,
+      "preprocessed_bytes": 2156598
+    },
+    {
+      "session_id": "af861ed9-9e1d-41a7-8400-b53c2995aed8",
+      "branch": "main",
+      "transcript": "sessions/main/20260618T230847Z_claude-code_af861ed9-9e1d-41a7-8400-b53c2995aed8_c858ba973162.jsonl",
+      "cached": false,
+      "chunks": 7,
+      "chunks_if_uncached": 7,
+      "raw_bytes": 52419357,
+      "preprocessed_bytes": 1574660
+    },
+    {
+      "session_id": "af861ed9-9e1d-41a7-8400-b53c2995aed8",
+      "branch": "docs/readme-refresh",
+      "transcript": "sessions/branches/docs-readme-refresh-34418cab/20260705T215931Z_claude-code_af861ed9-9e1d-41a7-8400-b53c2995aed8_1f324c1e0b17.jsonl",
+      "cached": false,
+      "chunks": 7,
+      "chunks_if_uncached": 7,
+      "raw_bytes": 52419357,
+      "preprocessed_bytes": 1574660
+    },
+    {
+      "session_id": "af861ed9-9e1d-41a7-8400-b53c2995aed8",
+      "branch": "codex/thomas-release-readiness",
+      "transcript": "sessions/branches/codex-thomas-release-readiness-ee13324e/20260609T182817Z_claude-code_af861ed9-9e1d-41a7-8400-b53c2995aed8_fb77fbd043d2.jsonl",
+      "cached": false,
+      "chunks": 4,
+      "chunks_if_uncached": 4,
+      "raw_bytes": 30729719,
+      "preprocessed_bytes": 849723
+    },
+    {
+      "session_id": "019f8699-0371-7851-a1ea-91e735789006",
+      "branch": "codex/current-main-source-of-truth",
+      "transcript": "sessions/branches/codex-current-main-source-of-truth-ecd10ec2/20260724T195219Z_codex_019f8699-0371-7851-a1ea-91e735789006_a8a92a057db2.jsonl",
+      "cached": false,
+      "chunks": 4,
+      "chunks_if_uncached": 4,
+      "raw_bytes": 41630069,
+      "preprocessed_bytes": 840274
+    },
+    {
+      "session_id": "af861ed9-9e1d-41a7-8400-b53c2995aed8",
+      "branch": "claude/thomas-asks",
+      "transcript": "sessions/branches/claude-thomas-asks-98742e3e/20260607T215519Z_claude-code_af861ed9-9e1d-41a7-8400-b53c2995aed8_60447aa90070.jsonl",
+      "cached": false,
+      "chunks": 4,
+      "chunks_if_uncached": 4,
+      "raw_bytes": 29098403,
+      "preprocessed_bytes": 806422
+    },
+    {
+      "session_id": "de272aad-c620-4d71-bbdd-27dd2d3dc8af",
+      "branch": "feat/brain-setup-onboarding",
+      "transcript": "sessions/branches/feat-brain-setup-onboarding-23d2d9ce/20260819T212417Z_claude-code_de272aad-c620-4d71-bbdd-27dd2d3dc8af_ca03a2aa13e0.jsonl",
+      "cached": false,
+      "chunks": 3,
+      "chunks_if_uncached": 3,
+      "raw_bytes": 49784520,
+      "preprocessed_bytes": 753746
+    },
+    {
+      "session_id": "de272aad-c620-4d71-bbdd-27dd2d3dc8af",
+      "branch": "p0p1/p1-new",
+      "transcript": "sessions/branches/p0p1-p1-new-044b95e3/20260817T174229Z_claude-code_de272aad-c620-4d71-bbdd-27dd2d3dc8af_14ae70e977be.jsonl",
+      "cached": false,
+      "chunks": 3,
+      "chunks_if_uncached": 3,
+      "raw_bytes": 49784520,
+      "preprocessed_bytes": 753746
+    },
+    {
+      "session_id": "928f9558-c860-40f7-919a-be6fa62f3381",
+      "branch": "wip/memory-lifecycle-plan-handoff-20260712",
+      "transcript": "sessions/branches/wip-memory-lifecycle-plan-handoff-20260712-c3933a82/20260715T082213Z_claude-code_928f9558-c860-40f7-919a-be6fa62f3381_d4d383d2bd17.jsonl",
+      "cached": false,
+      "chunks": 3,
+      "chunks_if_uncached": 3,
+      "raw_bytes": 18573785,
+      "preprocessed_bytes": 725743
+    },
+    {
+      "session_id": "019e849b-3b23-7890-8852-066ab00a19ad",
+      "branch": "main",
+      "transcript": "sessions/main/20260602T171529Z_codex_019e849b-3b23-7890-8852-066ab00a19ad_ae53453795e3.jsonl",
+      "cached": false,
+      "chunks": 3,
+      "chunks_if_uncached": 3,
+      "raw_bytes": 9232578,
+      "preprocessed_bytes": 616181
+    }
+  ]
+}

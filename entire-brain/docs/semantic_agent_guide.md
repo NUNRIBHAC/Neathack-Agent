@@ -1,0 +1,98 @@
+# Semantic Agent Guide
+
+## Install and discover agent instructions
+
+Run `entire brain init-agents` in the consuming project to install
+`.entire/agent-guide.md` plus managed pointers in `AGENTS.md` and
+`CLAUDE.md`. Reruns reconcile Graph and Brain blocks into one shared workflow and preserve your own text.
+Use `--repo <path>` for another project. Installation does not build indexes,
+call an agent, or start services.
+
+`entire brain agent-guide` prints the same guide; `guide` remains an alias.
+Use `entire brain capabilities --json` to discover compiled features and their
+requirements without a repository. Use `status --details --json` for the
+current repository's readiness. Graph's language/relation inventory remains
+available through `entire graph capabilities --json`.
+
+
+Use the local semantic brain as task-specific context. Treat freshness as part
+of the answer, not as decoration.
+
+Recommended intake flow:
+
+1. Run `entire brain status --json`; check `semantic.freshness.severity` before
+   graph inspection and `retrieval.freshness.severity` before query/get.
+   The default is the compact trust preflight; use `--details` only for
+   coverage histograms, staged-file classifications, or changed-symbol records.
+2. Use `entire brain inspect code <symbol> --json` (10 results by default) or
+   `entire brain inspect search-graph <query> --json` to find candidate symbols
+   and relation hits.
+3. Use `entire brain inspect query-graph "type:CALLS <query>" --json` when the
+   question needs a specific relation family.
+   Use `entire brain inspect graph-ui semantic-graph.html` when a local visual
+   graph explorer is useful.
+4. Use `entire brain inspect context <symbol> --json --include-content=false`
+   for relation-aware context (5 symbols by default).
+5. Use `entire brain inspect snippet <symbol-or-id> --json` before editing a
+   resolved symbol, and `entire brain inspect trace-path <from> <to> --json`
+   when you need to verify a directed static path.
+6. Use `entire brain inspect boundaries --kind route --json`, `entire brain inspect boundaries --kind tool --json`, or
+   `entire brain inspect boundaries --kind workflow --json` when the task is about project boundaries.
+7. Use `entire brain inspect dead-code --json` for local unused-callable
+   candidates, and `entire brain inspect ingest-traces <json-or-ndjson> --json`
+   to compare runtime trace edges to static graph edges. After ingest, use
+   `entire brain inspect query-graph type:RUNTIME_TRACE --json` to retrieve
+   persisted dynamic trace facts; `brief` and `trace-path` also include the
+   imported runtime trace edges.
+8. Use `entire brain inspect tests <symbol> --json` before choosing validation
+   commands for a changed symbol. Code, context, impact, and test JSON is compact
+   by default; use `--details` only when full provider records are required.
+   `entire brain inspect changes --json` maps diff-hunk line ranges to the
+   indexed symbols they actually touch, and persists
+   `semantic/changes/latest.json` by default; pass `--write-report=false` to
+   skip writing it.
+9. Use `entire brain workspace inspect context <workspace> <query> --json` (symbols) or
+   `entire brain workspace inspect graph <workspace> --json` (per-repo graph
+   metrics, shared external contracts, canonical route-template
+   route-call/import-candidate/scoped
+   package/package-keyed `cargo`/`gomod`/`maven`/`npm`/`pypi`/`nuget`/`gem`/`composer`
+   import/external symbol, including hyphen/underscore aliases for Python packages,
+   Rust crates, Ruby gems, and GitHub monorepo package dirs, GraphQL
+   operation-to-resolver/schema-field and schema-field-to-resolver, plus
+   event-channel producer-to-consumer,
+   Kubernetes workload/resource resource-candidate `cross_edges`, including
+   namespace-qualified resource endpoints with short-name fallback, Docker
+   Compose service resource-candidate `cross_edges`, and
+   a persisted `graph.json` artifact) or
+   `entire brain workspace query <workspace> <query> --json`
+   (facts/history/docs, grouped per repo; ids are repo-qualified for
+   `workspace get`) only for local workspaces that already list local repo
+   path hints.
+10. Use `entire brain mcp` only as a local stdio adapter when an agent needs MCP
+   tool calls instead of direct CLI commands.
+11. Refresh semantic data with `entire brain refresh index` when only
+   `semantic.freshness` is unsafe. Use `entire brain refresh --agent none` when
+   `retrieval.freshness` is unsafe because semantic-only refreshes do not
+   rebuild seed/docs.
+12. Add `--worktree` to either refresh only when uncommitted content is
+   intentionally part of the question; status verifies that exact dirty
+   snapshot and reports later drift.
+
+Do not publish semantic artifacts or send semantic context to remote services in
+phase 1.
+
+### Query input and modes
+
+Use `entire brain query "text"` for default hybrid retrieval. Select keyword
+matching with `--keyword` or semantic matching with `--semantic`; the two
+flags are mutually exclusive and belong only to the query command.
+Text may instead be supplied as `--query "text"`. Flags work before or after
+positional text; combining positional text and `--query` is an error.
+For example: `entire brain query --keyword --query "RetryPolicy" --json`.
+
+Workspace retrieval supports the same forms:
+`entire brain workspace query <workspace> --semantic --query "retry policy"`.
+The old `search` and `vsearch` commands remain hidden compatibility aliases.
+MCP agents should use `brain_query` with optional, mutually exclusive
+`keyword: true` or `semantic: true` arguments; `brain_search` and
+`brain_vsearch` remain compatibility tools.

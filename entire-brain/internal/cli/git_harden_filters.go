@@ -1,0 +1,206 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// A FOURTH execution vector, alongside the three neutralized in git_harden.go:
+// content FILTERS.
+//
+//	filter.<driver>.clean     runs when git converts WORKTREE content to its
+//	                          stored form. `git diff HEAD` compares the HEAD
+//	                          blob against the worktree file, so it must clean
+//	                          the worktree copy first -- which means the driver
+//	                          executes under the exact hardened argv the other
+//	                          three vectors are neutralized by:
+//	                            -c core.fsmonitor=false diff --no-ext-diff \
+//	                               --no-textconv --binary HEAD --
+//	filter.<driver>.smudge    the checkout direction. Not reachable from the
+//	                          read paths today, neutralized anyway so a future
+//	                          call path that checks content out is covered.
+//	filter.<driver>.process   a long-running protocol filter that SUPERSEDES
+//	                          clean and smudge, so blanking only .clean leaves
+//	                          an armed repository live.
+//
+// All three were confirmed against git 2.54.0 by arming them in a scratch
+// repository and observing the payload run. The driver is selected by an
+// in-tree .gitattributes entry (`* filter=pwn`); the command comes from config.
+//
+// WHY NOT --no-ext-diff-style flags: there are none. git offers no per-command
+// switch that disables the filter machinery for diff.
+//
+// WHY NOT GIT_ATTR_SOURCE: pointing attributes at the empty tree does stop an
+// in-tree .gitattributes from selecting a driver, and it neutralizes both
+// vectors -- but it is BYPASSABLE. .git/info/attributes is not a tree, is not
+// covered by GIT_ATTR_SOURCE, and is carried by a cloned repository just like
+// .git/config. Verified: with the driver selected from .git/info/attributes the
+// payload still ran. It would also silently change diff output by discarding
+// every legitimate attribute (-diff, text, eol, binary).
+//
+// So the neutralizer blanks the driver's COMMANDS, which works no matter which
+// attributes source selected it. `required` is forced false at the same time:
+// git aborts a read outright ("fatal: ... clean filter 'x' failed") when a
+// required filter has no command, and turning code execution into a hard
+// failure to index is just a different denial.
+//
+// WHY THE ENVIRONMENT AND NOT `-c`: a config subsection may contain "=", and
+// .gitattributes can select it. `-c` splits at the FIRST "=", so
+// `-c filter.na=me.clean=` sets "filter.na" to "me.clean=" and leaves the real
+// driver armed -- verified: the payload runs. GIT_CONFIG_KEY_n /
+// GIT_CONFIG_VALUE_n carry key and value in separate variables, so no driver
+// name can escape the neutralizer.
+//
+// WHY ONLY local AND worktree SCOPE: the finding is that a REPOSITORY must not
+// make git run code. A driver in the user's own ~/.gitconfig is not the
+// repository's code -- `git lfs install` writes filter.lfs.clean there -- and
+// blanking it would silently corrupt every diff of an LFS repository, since git
+// would compare a real worktree file against a stored pointer. Local and
+// worktree scope are exactly the scopes the repository itself carries.
+
+// gitConfigOverride is one key/value pair forced onto a git invocation.
+type gitConfigOverride struct {
+	Key   string
+	Value string
+}
+
+// gitFilterOverrideKeys are the three keys that name an executable, plus the
+// flag that decides whether blanking them is fatal.
+var gitFilterOverrideKeys = []struct{ suffix, value string }{
+	{"clean", ""},
+	{"smudge", ""},
+	{"process", ""},
+	{"required", "false"},
+}
+
+// repoFilterEnumerateTimeout bounds the one `git config` probe per repository.
+const repoFilterEnumerateTimeout = 5 * time.Second
+
+// repoFilterDriverOverrides enumerates the current effective configuration on
+// every invocation. A stat cache of .git/config misses included files, common
+// worktree configuration, conditional includes, and environment changes. Git's
+// --show-origin reports active origins only; it cannot prove a previously
+// inactive include is still inactive without reevaluating configuration.
+func repoFilterDriverOverrides(ctx context.Context, repoDir string) ([]gitConfigOverride, error) {
+	if strings.TrimSpace(repoDir) == "" {
+		return nil, nil
+	}
+	return enumerateRepoFilterDrivers(ctx, repoDir)
+}
+
+// enumerateRepoFilterDrivers asks git which filter.* keys the repository itself
+// sets. It spawns git directly rather than going through the hardened runner:
+// the runner calls back into this function, and `git config` reads no worktree
+// content, so no filter can run during the probe.
+//
+// Spawning directly means hardenedGitArgs does not run here, so this is the one
+// git invocation in the binary that has to carry gitHardenConfig itself.
+// Splicing the shared slice in rather than repeating its flags is what keeps
+// the probe from drifting behind the chokepoint: core.hooksPath was added to
+// gitHardenConfig after a `.git/hooks/post-index-change` was found to execute
+// during indexing, and a hand-copied `-c core.fsmonitor=false` here would have
+// silently missed it. `git config` does not touch the index and so cannot fire
+// post-index-change today; the flags are applied because "every git spawn is
+// hardened" is a cheaper invariant to keep than a per-call-site argument about
+// which hooks a subcommand can reach.
+func enumerateRepoFilterDrivers(ctx context.Context, repoDir string) ([]gitConfigOverride, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runCtx, cancel := context.WithTimeout(ctx, repoFilterEnumerateTimeout)
+	defer cancel()
+	// -z keeps the output unambiguous for a subsection name containing a
+	// newline; --show-scope tells local/worktree apart from global/system.
+	args := append(slices.Clone(gitHardenConfig),
+		"config", "-z", "--show-scope", "--name-only", "--get-regexp", `^filter\..*\.(clean|smudge|process|required)$`)
+	cmd := exec.CommandContext(runCtx, "git", args...)
+	cmd.Dir = repoDir
+	out, err := cmd.Output()
+	if err != nil {
+		if runCtx.Err() != nil {
+			return nil, fmt.Errorf("enumerate repository filter drivers: %w", runCtx.Err())
+		}
+		// Git reports no matching keys with exit 1 and no output. Any other
+		// failure must block the protected command and must not enter the cache.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && len(out) == 0 && len(exitErr.Stderr) == 0 {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("enumerate repository filter drivers: %w", err)
+	}
+	fields := strings.Split(string(out), "\x00")
+	seen := map[string]bool{}
+	var drivers []string
+	for i := 0; i+1 < len(fields); i += 2 {
+		scope, key := fields[i], fields[i+1]
+		if scope != "local" && scope != "worktree" {
+			continue
+		}
+		driver, ok := filterDriverFromConfigKey(key)
+		if !ok || seen[driver] {
+			continue
+		}
+		seen[driver] = true
+		drivers = append(drivers, driver)
+	}
+	var overrides []gitConfigOverride
+	for _, driver := range drivers {
+		for _, k := range gitFilterOverrideKeys {
+			overrides = append(overrides, gitConfigOverride{Key: "filter." + driver + "." + k.suffix, Value: k.value})
+		}
+	}
+	return overrides, nil
+}
+
+// filterDriverFromConfigKey pulls "na=me" out of "filter.na=me.clean". The
+// driver name is everything between the first and last dot, so a name
+// containing dots, equals signs or spaces round-trips intact.
+func filterDriverFromConfigKey(key string) (string, bool) {
+	rest, ok := strings.CutPrefix(key, "filter.")
+	if !ok {
+		return "", false
+	}
+	dot := strings.LastIndex(rest, ".")
+	if dot <= 0 {
+		return "", false
+	}
+	return rest[:dot], true
+}
+
+// gitConfigOverrideEnv appends overrides to base as GIT_CONFIG_KEY_n /
+// GIT_CONFIG_VALUE_n entries, continuing any GIT_CONFIG_COUNT the caller's
+// environment already set rather than clobbering it.
+func gitConfigOverrideEnv(base []string, overrides []gitConfigOverride) []string {
+	if len(overrides) == 0 {
+		return base
+	}
+	next := 0
+	for _, entry := range base {
+		if value, ok := strings.CutPrefix(entry, "GIT_CONFIG_COUNT="); ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && n > 0 {
+				next = n
+			}
+		}
+	}
+	out := make([]string, 0, len(base)+2*len(overrides)+1)
+	for _, entry := range base {
+		if strings.HasPrefix(entry, "GIT_CONFIG_COUNT=") {
+			continue
+		}
+		out = append(out, entry)
+	}
+	for _, override := range overrides {
+		out = append(out,
+			"GIT_CONFIG_KEY_"+strconv.Itoa(next)+"="+override.Key,
+			"GIT_CONFIG_VALUE_"+strconv.Itoa(next)+"="+override.Value,
+		)
+		next++
+	}
+	return append(out, "GIT_CONFIG_COUNT="+strconv.Itoa(next))
+}

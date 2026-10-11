@@ -1,0 +1,179 @@
+package cli
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+// loadAllFactBranches scans the facts directory and returns every stored fact
+// grouped by the branch recorded on each record (not the on-disk slug, which is
+// lossy). It is the basis for rebuilding the manifest after a single-branch
+// mutation and for whole-store operations like gc.
+func loadAllFactBranches(brainDir string) (map[string][]factRecord, error) {
+	root := filepath.Join(brainDir, factsDirName)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return map[string][]factRecord{}, nil
+		}
+		return nil, err
+	}
+	byBranch := map[string][]factRecord{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		// Same containment guards the single-branch read applies.
+		//
+		// loadFacts(brainDir, branch) rejects a symlinked path component and a
+		// non-regular fact file (facts.go:146,150). This inventory walk
+		// applied neither, so a symlinked facts.ndjson inside a real branch
+		// directory was READ -- measured: loadFacts refuses it with "path
+		// component must not be a symlink" while this function returned its
+		// content from outside the brain.
+		//
+		// A symlinked branch DIRECTORY was never the vector: os.ReadDir
+		// reports types without following links, so entry.IsDir() is false for
+		// one and the continue above already skips it. The gap was the file
+		// one level down.
+		rel := filepath.ToSlash(filepath.Join(factsDirName, entry.Name(), factsFileName))
+		if err := rejectExistingSymlinkPathComponents(brainDir, rel); err != nil {
+			return nil, err
+		}
+		path := filepath.Join(brainDir, filepath.FromSlash(rel))
+		if info, err := os.Lstat(path); err == nil && !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("fact store is not a regular file: %s", rel)
+		}
+		records, err := parseFactsFile(path)
+		if err != nil {
+			return nil, err
+		}
+		for _, record := range records {
+			byBranch[record.Branch] = append(byBranch[record.Branch], record)
+		}
+	}
+	return byBranch, nil
+}
+
+// countFactProposals totals the pending proposals across the given branches.
+func countFactProposals(brainDir string, branches []string) int {
+	total := 0
+	for _, branch := range branches {
+		if proposals, err := loadFactProposals(brainDir, branch); err == nil {
+			total += len(proposals)
+		}
+	}
+	return total
+}
+
+// updateFactSourceManifest recomputes sources.facts from the whole on-disk fact
+// store and writes it back. Commands that mutate facts outside the distill
+// pipeline (remember, facts review/promote/gc) call this so `status` and the
+// manifest stay accurate. Chunk counts are preserved from the existing source
+// (they describe the last distill run, not these edits).
+func updateFactSourceManifest(brainDir string, now time.Time) error {
+	return withBrainWriteLock(brainDir, func() error {
+		return updateFactSourceManifestLocked(brainDir, now)
+	})
+}
+
+// reclassifyAllFactBranches backfills the deterministic KIND/LOCUS onto every
+// fact branch (non-destructive: only fills facts missing a valid kind, while
+// locus is always reconciled) and rebuilds the fact source manifest so by_kind
+// stays accurate. No agent, no tokens. A no-op when no facts exist. Returns the
+// number of facts changed. Holds the brain write lock for the whole pass.
+//
+// This runs from `refresh` so a kind never goes stale: facts distilled before
+// kind-storage, or any fact left without a valid kind, are repaired on the next
+// refresh rather than needing a manual `facts reclassify`.
+func reclassifyAllFactBranches(brainDir string, now time.Time) (int, error) {
+	changed := 0
+	err := withBrainWriteLock(brainDir, func() error {
+		byBranch, err := loadAllFactBranches(brainDir)
+		if err != nil {
+			return err
+		}
+		if len(byBranch) == 0 {
+			return nil
+		}
+		for branch, facts := range byBranch {
+			if c := reclassifyFacts(facts, false); c > 0 {
+				if err := writeFacts(brainDir, branch, facts); err != nil {
+					return err
+				}
+				changed += c
+			}
+		}
+		return updateFactSourceManifestLocked(brainDir, now)
+	})
+	return changed, err
+}
+
+func updateFactSourceManifestLocked(brainDir string, now time.Time) error {
+	byBranch, err := loadAllFactBranches(brainDir)
+	if err != nil {
+		return err
+	}
+	branches := make([]string, 0, len(byBranch))
+	for branch := range byBranch {
+		branches = append(branches, branch)
+	}
+	proposals := countFactProposals(brainDir, branches)
+
+	manifest, err := loadBrainManifest(brainDir)
+	if err != nil {
+		return err
+	}
+	var previous *factSourceManifest
+	if manifest.Sources != nil && manifest.Sources.Facts != nil {
+		previous = manifest.Sources.Facts
+	}
+	source := summarizeFactSource(now, byBranch, 0, 0, proposals, nil)
+	preserveFactDistillEvidence(source, previous)
+	if manifest.Sources == nil {
+		manifest.Sources = &brainSources{}
+	}
+	manifest.Sources.Facts = source
+	if manifest.GeneratedAt.IsZero() {
+		manifest.GeneratedAt = now
+	}
+	return writeBrainManifestAndReadme(brainDir, *manifest)
+}
+
+func preserveFactDistillEvidence(source, previous *factSourceManifest) {
+	if source == nil || previous == nil {
+		return
+	}
+	source.LastDistilledAt = previous.LastDistilledAt
+	if previous.TokenUsage != nil {
+		usage := *previous.TokenUsage
+		source.TokenUsage = &usage
+	}
+	source.ChunksScanned = previous.ChunksScanned
+	source.ChunksDistilled = previous.ChunksDistilled
+	source.CacheHits = previous.CacheHits
+	source.FailedChunks = previous.FailedChunks
+	source.PreprocessedBytes = previous.PreprocessedBytes
+	source.ExtractionWaitSeconds = previous.ExtractionWaitSeconds
+	source.ReconcileSeconds = previous.ReconcileSeconds
+	source.WriteSeconds = previous.WriteSeconds
+	// The run-configuration and call-count evidence must survive too: facts
+	// admin commands (review/promote/gc) rebuild this summary, and zeroing
+	// these blanks the fields the release audit reads from the manifest.
+	source.Agent = previous.Agent
+	source.Model = previous.Model
+	source.Effort = previous.Effort
+	source.Branch = previous.Branch
+	source.Force = previous.Force
+	source.Jobs = previous.Jobs
+	source.ExtractionJobsCap = previous.ExtractionJobsCap
+	source.MaxChunkBytes = previous.MaxChunkBytes
+	source.Confidence = previous.Confidence
+	source.ExtractionCalls = previous.ExtractionCalls
+	source.ReconcileCalls = previous.ReconcileCalls
+	source.TotalAgentCalls = previous.TotalAgentCalls
+	source.TotalSeconds = previous.TotalSeconds
+	source.Warnings = append([]string(nil), previous.Warnings...)
+}

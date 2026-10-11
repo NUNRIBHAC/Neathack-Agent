@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "repo_root": "../../../..",
+  "mise": "mise.toml",
+  "reports": {
+    "release": "benchmarks/agent-brain/evidence/release/codex-audit-report.json",
+    "replay_lab_clean": "benchmarks/agent-brain/evidence/replay-lab-clean/codex-audit-report.json",
+    "radar_tool": "benchmarks/agent-brain/evidence/radar-tool/radar-tool-audit-report.json",
+    "workspace_radar": "benchmarks/agent-brain/evidence/workspace-radar/workspace-radar-audit-report.json",
+    "distill": "benchmarks/agent-brain/evidence/distill-perf/distill-perf-audit-report.json",
+    "distill_large": "benchmarks/agent-brain/evidence/distill-perf-large/distill-perf-audit-report.json",
+    "facts": "benchmarks/agent-brain/evidence/facts-eval/facts-eval-audit-report.json"
+  },
+  "docs": {
+    "press_release": "docs/release_press_release.md"
+  },
+  "required_press_guardrails": [
+    "frontend/hosted-model distill",
+    "facts beat raw",
+    "semantic usefulness",
+    "workspace Radar",
+    "multi-agent collaboration is complete",
+    "backend/Slack access",
+    "turn signing"
+  ],
+  "required_release_proof_scopes": [
+    "history",
+    "mcp",
+    "mcp_radar_location_only"
+  ],
+  "required_named_tool_proof_scopes": [
+    "mcp_radar_location_only"
+  ],
+  "required_mise_tasks": [
+    "check",
+    "release:evidence",
+    "clean-proof:evidence",
+    "radar:evidence",
+    "radar:agent-evidence",
+    "workspace-radar:evidence",
+    "distill:evidence",
+    "distill:large:evidence",
+    "facts:evidence",
+    "semantic:evidence",
+    "release:matrix",
+    "release:readiness"
+  ]
+}
