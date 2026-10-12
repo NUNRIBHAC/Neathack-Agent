@@ -1,4 +1,4 @@
-"""Testes do DisruptRadarAgent em modo demo (sem rede, sem Bedrock)."""
+"""Tests for DisruptRadarAgent in demo mode (no network, no Bedrock)."""
 
 import sys
 from pathlib import Path
@@ -16,13 +16,13 @@ FAKE_PLAN = (
 
 
 def fake_bedrock(self, prompt, max_tokens=1024):
-    """Substitui o Bedrock: devolve o plano completo para prompts de planning."""
+    """Replaces Bedrock: returns the full plan for planning prompts."""
     return FAKE_PLAN
 
 
 @pytest.fixture
 def agent(tmp_path, monkeypatch):
-    """Fixar flags de demo, credenciais fictícias e diretório temporário."""
+    """Set demo flags, fake credentials and a temporary directory."""
     monkeypatch.setenv("RUN_DEMO_FIXTURE_MODE", "true")
     monkeypatch.setenv("INJECT_LOCAL_FAULT_SIMULATION", "true")
     monkeypatch.setenv("NEATLOGS_API_KEY", "test-key")
@@ -30,11 +30,11 @@ def agent(tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(agent_module.DisruptRadarAgent, "call_bedrock", fake_bedrock)
-    # Impede que o tracker abra threads de envio para a rede (timeouts de 10s).
+    # Prevents the tracker from opening network-sending threads (10s timeouts).
     monkeypatch.setattr(agent_module.neatlogs, "get_tracker", lambda: None)
 
     instance = DisruptRadarAgent(
-        goal="Teste de deteção de disrupção",
+        goal="Disruption detection test",
         target_domain="acme.example.com",
         max_retries=3,
     )
@@ -63,7 +63,7 @@ def test_risk_high_and_verified(agent):
 
 
 def test_send_trace_v1_payload(monkeypatch):
-    """Valida o transporte real /v1/trace sem tocar na rede."""
+    """Validates the real /v1/trace transport without touching the network."""
     monkeypatch.setenv("NEATLOGS_API_KEY", "test-key")
     monkeypatch.setenv("NEATLOGS_ENDPOINT", "https://ingest.neatlogs.com/")
     captured = {}
@@ -81,7 +81,7 @@ def test_send_trace_v1_payload(monkeypatch):
         return FakeResponse()
 
     monkeypatch.setattr(agent_module.requests, "post", fake_post)
-    state = agent_module.RunState("Teste de envio")
+    state = agent_module.RunState("Trace send test")
     state.plan = agent_module.DEFAULT_PLAN[:]
     state.findings = {
         "current_headcount": 140,
@@ -90,7 +90,7 @@ def test_send_trace_v1_payload(monkeypatch):
     }
     state.is_verified = True
     state.risk_level = "HIGH"
-    state.final_report = "Relatório de teste"
+    state.final_report = "Test report"
     agent_module.send_trace_v1(state, "acme.example.com")
 
     assert captured["url"] == "https://ingest.neatlogs.com/v1/trace"
