@@ -5,9 +5,10 @@ domain, analyzes hiring velocity, verifies the indicator math and produces an
 executive report.
 
 - Repository: https://github.com/NUNRIBHAC/Neathack-Agent
-- Real neatlogs trace (07:16PM, 8 spans, risk HIGH, verification True):
-  http://app.neatlogs.com/traces/5b5173b4db9c8f9b75b0c915d33ba0f1?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91&returnTo=%2Ftraces%3Ffrom%3D2026-09-27T23%253A00%253A00.000Z%26to%3D2026-10-11T22%253A59%253A59.999Z%26orgId%3D7526b7af-8d30-45b5-9dc4-741078f5b938%26projectId%3D4668228e-656b-4e5b-83b6-b1a6ebd49c91%26groupBy%3Dnone%26timezone%3DEurope%252FLisbon
+- Real neatlogs trace (07:16PM, 7 spans, risk HIGH, verification True):
+ https://app.neatlogs.com/traces?pageSize=100&from=2026-10-10T23%3A00%3A00.000Z&to=2026-10-12T22%3A59%3A00.000Z&orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91&groupBy=none&timezone=Europe%2FLisbon
 - Tests: 5 passed (`pytest test_agent.py -v`)
+- Entire: https://entire.io/gh/NUNRIBHAC/Neathack-Agent
 
 ## Live demo
 
@@ -70,7 +71,7 @@ You can log in three ways:
   (never per span), with `Authorization: Bearer <NEATLOGS_API_KEY>` and a nested JSON
   object (`children`). The destination is configurable via `NEATLOGS_ENDPOINT`
   (default `https://ingest.neatlogs.com/`). Evidence: trace
-  `5b5173b4db9c8f9b75b0c915d33ba0f1` (8 spans, HIGH, verified true) and probe traces
+  `5b5173b4db9c8f9b75b0c915d33ba0f1` (7 spans, HIGH, verified true) and probe traces
   (2x, 06:43PM).
 - Without `NEATLOGS_API_KEY`, telemetry degrades to no-op (both `init` and
   `send_trace_v1` skip sending).
@@ -90,9 +91,14 @@ You can log in three ways:
 
 | Mandatory pillar | Status | Evidence |
 |---|---|---|
-| neatlogs | ✅ | trace `5b5173b4db9c8f9b75b0c915d33ba0f1` (8 spans, HIGH, verified true) |
+| neatlogs | ✅ | 12 traces:<br>• `54bc29bf746dc54de39246fb610972f3` (2 spans, probe) — [link](https://app.neatlogs.com/traces/54bc29bf746dc54de39246fb610972f3?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `1227b34965a84a879ae6a00f29a901f8` (2 spans, probe) — [link](https://app.neatlogs.com/traces/1227b34965a84a879ae6a00f29a901f8?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `5b5173b4db9c8f9b75b0c915d33ba0f1` (7 spans, HIGH, verified true, openai.com +40.0%) — [link](https://app.neatlogs.com/traces/5b5173b4db9c8f9b75b0c915d33ba0f1?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `6d1327dced7976b98c204f2c4344bc73` (9 spans, LOW, verified false, growth_metrics 404) — [link](https://app.neatlogs.com/traces/6d1327dced7976b98c204f2c4344bc73?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `e5247d013a358be3cfb51d696e5e6815` (9 spans, LOW, verified false, enrich 400) — [link](https://app.neatlogs.com/traces/e5247d013a358be3cfb51d696e5e6815?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `fb4a7e3f32c21cd7cb4530fa87c50ac9` (9 spans, LOW, verified false, sem headcounts) — [link](https://app.neatlogs.com/traces/fb4a7e3f32c21cd7cb4530fa87c50ac9?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `97d61923a997ed4f43b0c42e3397fb9f` (6 spans, LOW, verified true, retool.com -3.5%) — [link](https://app.neatlogs.com/traces/97d61923a997ed4f43b0c42e3397fb9f?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `40c1a73aeb13c2bfd3bf4ff144f64a4c` (6 spans, LOW, verified true, retool.com -3.5%) — [link](https://app.neatlogs.com/traces/40c1a73aeb13c2bfd3bf4ff144f64a4c?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `0e3a83a28bfc9a85421a3132312d1549` (6 spans, HIGH, verified true, openai.com +40.0%) — [link](https://app.neatlogs.com/traces/0e3a83a28bfc9a85421a3132312d1549?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `04376a4e5346935fc6bcfb961c6d3209` (6 spans, HIGH, verified true, openai.com +30.4%) — [link](https://app.neatlogs.com/traces/04376a4e5346935fc6bcfb961c6d3209?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `9df59489d977cd24bebd7b8f02445e94` (6 spans, HIGH, verified true, anthropic.com +41.2%) — [link](https://app.neatlogs.com/traces/9df59489d977cd24bebd7b8f02445e94?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91)<br>• `85b9cc2415cf1533a17714a5ccc901a9` (6 spans, HIGH, verified true, openai.com +30.4%, LLM report) — [link](https://app.neatlogs.com/traces/85b9cc2415cf1533a17714a5ccc901a9?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91) |
+
+> **Probes (HTTP contract):** `54bc29bf...` and `1227b349...` use `test-model` with pricing `unpriced/unknown_model`: these are the HTTP contract probes described in section 2 (2x, 06:43PM). Consistent.
+>
+> **Distinct retool.com executions:** `97d61923...` and `40c1a73a...` are separate runs of the same domain (retool.com, -3.48%, 416/431), not duplicates.
+
 | Entire | ✅ | `commit_linking: always`, PR #1 (`3ac4c3c`), local atomic checkpoints |
-| cfo.ai | ⏳ | `docs/business_plan.pdf` being generated (token cost vs subscriptions matrix) |
+| cfo.ai | ✅ | `docs/DisruptRadar_Modelo_Financeiro (DisruptRadar_Modelo_Financeiro-ENG) and docs/Financial model (2 pages) (Financial model (2 pages)-ENG)`|
 
 Official weights: PENDING (the server has not announced them yet; we do not fabricate
 platform metrics).
@@ -194,3 +200,73 @@ boto3==1.43.111
 pytest==9.1.1
 neatlogs==1.1.8
 ```
+
+## 9. Financial model docs
+
+**Start with the approved scenarios.** The Base case has €30,096 revenue, €15,120
+costs and €14,976 EBITDA. Pessimistic remains €8,000 / €6,000 / €2,000; Optimistic
+remains €80,000 / €24,000 / €56,000 and is conditional. These are annual planning
+scenarios, not observed results.
+
+**The assumptions that drive the forecast.** The approved Pro price is €99/month.
+Average usage is assumed to be 10 domains per customer, at an estimated
+€3/domain/month: €30 of delivery costs per customer-month. Opening cash is €20,000.
+Usage and vendor costs still need validation against actual consumption and invoices.
+
+**The Base monthly forecast controls.** The Base forecast uses €6,000 of annual fixed
+costs, or €500/month. The forecast runs from January to December 2027. The customer
+curve is your supplied plan; changing a saved input changes the calculations that
+read it.
+
+**Follow customers into earnings and cash.** Monthly revenue uses month-end customers
+x €99, with no proration. Delivery costs follow customer volumes; fixed costs stay at
+€500/month. January EBITDA is -€431, February -€224 and March +€121. Collections and
+payments are assumed to occur in the same month; taxes and capital expenditure are
+excluded.
+
+**Check that the annual numbers tie.** The curve totals 304 customer-months: €30,096
+revenue, €9,120 delivery costs and €6,000 fixed costs produce €14,976 EBITDA.
+Revenue, cost and EBITDA differences against the Base matrix are all zero. Minimum
+monthly closing cash is €19,345; year-end cash is €34,976.
+
+**Test a higher price without changing the plan.** Try €99, €109 or €119/month. This
+control changes only the simulator preview, not the saved scenarios or tables. The
+approved price remains €99. A higher price helps only if lost demand does not consume
+the extra contribution.
+
+**Stress-test the pitch with demand loss.** Demand loss reduces customer volumes
+proportionally in every month. Revenue and avoidable delivery costs fall; fixed costs
+remain unchanged. At €109 with 10% demand loss, annual EBITDA is €15,614.40; at €119
+with 20% loss, it is €15,644.80. These are sensitivity tests, not measured price
+elasticity.
+
+**How much demand can you afford to lose?** With €30 delivery costs per customer-month
+and €500/month fixed costs, €109 can tolerate 12.658% demand loss and €119 can
+tolerate 22.472%, while matching Base EBITDA of €14,976. These thresholds update with
+the simulated price and costs. Customer-months measure annual volume, not year-end
+customers.
+
+**Break-even is a different threshold.** Under the Base cost assumptions, EBITDA zero
+requires 86.96 / 75.95 / 67.42 customer-months at €99 / €109 / €119. Whole-number
+minimums are 87 / 76 / 68. Twelve year-end customers do not establish the pessimistic
+case's annual volume or prove that it covers costs.
+
+**Challenge the vendor cost estimate.** Try changing the cost per domain from €3 to
+€4. With 304 customer-months, 10 domains per customer and no demand loss, that reduces
+annual EBITDA and closing cash by €3,040. The control changes the preview only.
+Actual savings depend on how the vendor really charges.
+
+**Fixed costs do not fall with demand.** Try €300, €400 or €500/month. With the
+approved €99 price and no demand loss, annual EBITDA is €17,376 / €16,176 / €14,976
+respectively. The approved Base uses €500. The nine-cell reference grid is a saved
+constant-demand comparison; it does not update when you move the preview controls.
+
+**See when the decision affects cash.** The chart compares saved Base cash with the
+simulated path. Check the minimum monthly balance as well as the year-end balance:
+annual profit alone can hide a funding gap. The projection assumes same-month
+collections and payments and excludes taxes, investment and financing.
+
+**Keep the Optimistic condition visible.** The €56,000 Optimistic EBITDA depends on an
+effective delivery cost of €2.59875/domain/month, with €3,000 annual fixed costs: a
+required 13.375% reduction versus €3. That discount is not confirmed. The calculation
+uses Pro-equivalent customer-months, not an Enterprise sales mix.
