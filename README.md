@@ -276,5 +276,7 @@ uses Pro-equivalent customer-months, not an Enterprise sales mix.
 <img width="425" height="92" alt="Captura de ecrã 2026-10-12 124306" src="https://github.com/user-attachments/assets/51418494-b055-4f5b-810c-0ac79d5ff389" />
 <img width="220" height="67" alt="Captura de ecrã 2026-10-12 124418" src="https://github.com/user-attachments/assets/148832b2-3f39-4d37-b9a0-ca3fb803095a" />
 <img width="177" height="46" alt="Captura de ecrã 2026-10-12 124325" src="https://github.com/user-attachments/assets/ab29ed98-f9c5-4c20-90c5-0c327f1009fe" />
+<img width="225" height="52" alt="Captura de ecrã 2026-10-12 125333" src="https://github.com/user-attachments/assets/13190c9b-2087-49f0-9725-8cd30660a268" />
+
 
 
