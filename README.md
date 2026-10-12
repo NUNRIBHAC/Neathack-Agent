@@ -1,3 +1,4 @@
+
 # DisruptRadar — Competitive Intelligence Agent
 <img width="1280" height="800" alt="954030ba23a77659b91faf4a9269cef93779a0ec15825999f8e8fbd5cac164c4" src="https://github.com/user-attachments/assets/0a30376c-532b-4c47-9b84-b9fb8f937c07" />
 
@@ -103,7 +104,9 @@ You can log in three ways:
 
 Official weights: PENDING (the server has not announced them yet; we do not fabricate
 platform metrics).
-
+<img width="1567" height="796" alt="Captura de ecrã 2026-10-12 131430" src="https://github.com/user-attachments/assets/66df7e98-c570-4cac-8d4e-95d46a1df9d1" />
+<img width="1542" height="887" alt="Captura de ecrã 2026-10-12 131410" src="https://github.com/user-attachments/assets/cc147886-c04a-41ef-b2a0-b05ca53114e4" />
+<img width="1532" height="815" alt="Captura de ecrã 2026-10-12 131339" src="https://github.com/user-attachments/assets/12f75e0d-130a-4dad-a135-6d41bd537554" />
 ## 5. Clean install
 
 ```powershell
