@@ -1,4 +1,5 @@
 # DisruptRadar — Competitive Intelligence Agent
+<img width="1280" height="800" alt="954030ba23a77659b91faf4a9269cef93779a0ec15825999f8e8fbd5cac164c4" src="https://github.com/user-attachments/assets/0a30376c-532b-4c47-9b84-b9fb8f937c07" />
 
 Autonomous agent for neatHack 2026: monitors headcount growth signals for a target
 domain, analyzes hiring velocity, verifies the indicator math and produces an
@@ -113,7 +114,8 @@ python -m venv .venv
 pip install -r requirements.txt
 Copy-Item .env.example .env   # fill in with real keys; .env is never committed
 ```
-
+<img width="1280" height="900" alt="4ae46a9d69d78aaa1248ad01e6035739350cfbddce67fddce54b063c26ddc01d" src="https://github.com/user-attachments/assets/e9e72075-3dbe-4cc2-b04d-6124ec59d9ac" />
+<img width="1280" height="800" alt="c1d4a1a51bafdfac5a140f30f8f28230cf512c2f0484d1e04622eb5226cb78b2" src="https://github.com/user-attachments/assets/54bc1672-ca47-44ae-875a-afc6f0787e82" />
 ## 6. Running by mode
 
 ### Demo (synthetic data + simulated failure)
@@ -270,3 +272,9 @@ collections and payments and excludes taxes, investment and financing.
 effective delivery cost of €2.59875/domain/month, with €3,000 annual fixed costs: a
 required 13.375% reduction versus €3. That discount is not confirmed. The calculation
 uses Pro-equivalent customer-months, not an Enterprise sales mix.
+
+<img width="425" height="92" alt="Captura de ecrã 2026-10-12 124306" src="https://github.com/user-attachments/assets/51418494-b055-4f5b-810c-0ac79d5ff389" />
+<img width="220" height="67" alt="Captura de ecrã 2026-10-12 124418" src="https://github.com/user-attachments/assets/148832b2-3f39-4d37-b9a0-ca3fb803095a" />
+<img width="177" height="46" alt="Captura de ecrã 2026-10-12 124325" src="https://github.com/user-attachments/assets/ab29ed98-f9c5-4c20-90c5-0c327f1009fe" />
+
+
