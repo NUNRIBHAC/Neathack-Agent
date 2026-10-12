@@ -1,83 +1,103 @@
-# DisruptRadar — Agente de Inteligência Competitiva
+# DisruptRadar — Competitive Intelligence Agent
 
-Agente autónomo para o neatHack 2026: monitoriza sinais de crescimento de headcount de um
-domínio alvo, analisa a velocidade de contratação, verifica a matemática dos indicadores e
-produz um relatório executivo.
+Autonomous agent for neatHack 2026: monitors headcount growth signals for a target
+domain, analyzes hiring velocity, verifies the indicator math and produces an
+executive report.
 
-- Repositório: https://github.com/NUNRIBHAC/Neathack-Agent
-- Trace neatlogs real (07:16PM, 8 spans, risco HIGH, verificação True):
+- Repository: https://github.com/NUNRIBHAC/Neathack-Agent
+- Real neatlogs trace (07:16PM, 8 spans, risk HIGH, verification True):
   http://app.neatlogs.com/traces/5b5173b4db9c8f9b75b0c915d33ba0f1?orgId=7526b7af-8d30-45b5-9dc4-741078f5b938&projectId=4668228e-656b-4e5b-83b6-b1a6ebd49c91&returnTo=%2Ftraces%3Ffrom%3D2026-09-27T23%253A00%253A00.000Z%26to%3D2026-10-11T22%253A59%253A59.999Z%26orgId%3D7526b7af-8d30-45b5-9dc4-741078f5b938%26projectId%3D4668228e-656b-4e5b-83b6-b1a6ebd49c91%26groupBy%3Dnone%26timezone%3DEurope%252FLisbon
-- Testes: 5 passed (`pytest test_agent.py -v`)
+- Tests: 5 passed (`pytest test_agent.py -v`)
 
-## Arquitetura do loop
+## Live demo
+
+Try the live website: https://intel-radar-1.preview.emergentagent.com/
+
+You can log in three ways:
+
+1. Pre-created test account:
+   - Email: `demo1@test.vc`
+   - Password: `demo123` (already has domains on the watchlist: stripe.com, retool.com)
+2. Admin account:
+   - Email: `admin@disruptradar.io`
+   - Password: `radar1234`
+3. Create your own account:
+   - Click "Sign up" on the login screen and register with any email + password (minimum 6 characters). You immediately get your own workspace.
+   - There is also a "Continue with Google" button for social login.
+
+## Loop architecture
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
-│ run_agent (span AGENT)                                             │
-│  1. build_plan      -> span TOOL (Bedrock ou plano fixo)           │
-│  2. FETCH_DATA      -> span TOOL (Crustdata live ou fixture)       │
+│ run_agent (AGENT span)                                             │
+│  1. build_plan      -> TOOL span (LLM or fixed plan)               │
+│  2. FETCH_DATA      -> TOOL span (live Crustdata or fixture)       │
 │  3. ANALYZE_SIGNALS -> growth_pct                                 │
-│  4. VERIFY_METRICS  -> recálculo + comparação (gate)              │
+│  4. VERIFY_METRICS  -> recompute + comparison (gate)              │
 │  5. ASSESS_RISK     -> LOW / MEDIUM / HIGH                        │
-│  6. RENDER_REPORT   -> span TOOL (Bedrock ou fallback offline)    │
-│  retry/backoff: min(1.5 * tentativa, 10.0)s, máx. 3 tentativas    │
-│  checkpoint atómico (tmp + os.replace) a cada transição           │
+│  6. RENDER_REPORT   -> TOOL span (LLM or offline fallback)        │
+│  retry/backoff: min(1.5 * attempt, 10.0)s, max 3 attempts         │
+│  atomic checkpoint (tmp + os.replace) on every transition         │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-## 1. Mapeamento real da API Crustdata
+## 1. Real Crustdata API mapping
 
-- Base configurável por `CRUSTDATA_API_URL` (default `https://api.crustdata.com`),
-  endpoint `POST /company/growth_metrics`, payload `{"company_domain": "<domínio>"}`.
-- Autenticação por header `Authorization: Token <CRUSTDATA_API_KEY>`.
-- Extração defensiva de `current_headcount`/`previous_headcount` de dicionários
-  imbricados; se a API devolver apenas a percentagem de crescimento, o valor em falta
-  é derivado por matemática inversa.
-- Guarda de sanidade: `growth_pct <= -100.0` é rejeitado (headcount não pode ser
-  zero/negativo).
-- Em `RUN_DEMO_FIXTURE_MODE=true` não há tráfego de rede: usa dados sintéticos.
+- Base configurable via `CRUSTDATA_API_URL` (default `https://api.crustdata.com`),
+  endpoint `POST /company/enrich`, payload
+  `{"domains": ["<domain>"], "exact_match": true, "fields": ["basic_info", "headcount"]}`.
+- Authentication via `Authorization: Bearer <CRUSTDATA_API_KEY>` header, plus
+  `x-api-version: 2025-11-01`.
+- Defensive extraction of `current_headcount` from `headcount.total` and of the
+  growth percentage from `headcount.growth_percent.six_months` (fallback: `yoy`);
+  `previous_headcount` is derived by reverse math: `prev = current / (1 + growth/100)`.
+- The `X-Credits-Used` response header is captured as `credits_used`.
+- Sanity guard: `growth_pct <= -100.0` is rejected (headcount cannot be zero or
+  negative).
+- In `RUN_DEMO_FIXTURE_MODE=true` there is no network traffic: synthetic data is used.
 
-## 2. Instrumentação nativa do SDK neatlogs
+## 2. Native neatlogs SDK instrumentation
 
-- `neatlogs.init(api_key=..., tags=["disrupt-radar"])` no arranque (assinatura real do
+- `neatlogs.init(api_key=..., tags=["disrupt-radar"])` at startup (real signature of
   SDK 1.1.8: `init(api_key, tags, debug)`).
-- Spans manuais via `LLMTracker.start_llm_span(...)` / `end_llm_span(...)` nos pontos
-  críticos: `run_agent` (AGENT), `build_plan` (TOOL), `fetch_data` (TOOL) e
-  `call_bedrock` (TOOL). Todos os spans partilham o `trace_id` da sessão, formando um
-  trace por execução.
-- O SDK 1.1.8 envia para `https://app.neatlogs.com/api/data/v2` (endpoint fixo no
-  `core.py`). Probe confirmou que este endpoint está descontinuado (404).
-- Transporte real: `send_trace_v1()` faz um único `POST /v1/trace` por execução (nunca
-  por span), com `Authorization: Bearer <NEATLOGS_API_KEY>` e um objeto JSON aninhado
-  (`children`). O destino é configurável por `NEATLOGS_ENDPOINT` (default
-  `https://ingest.neatlogs.com/`). Evidência: trace `5b5173b4db9c8f9b75b0c915d33ba0f1`
-  (8 spans, HIGH, verified true) e traces de probe (2×, 06:43PM).
-- Sem `NEATLOGS_API_KEY`, a telemetria degrada para no-op (tanto o init como o
-  `send_trace_v1` saltam o envio).
+- Manual spans via `LLMTracker.start_llm_span(...)` / `end_llm_span(...)` at the
+  critical points: `run_agent` (AGENT), `build_plan` (TOOL), `fetch_data` (TOOL) and
+  `call_bedrock` (TOOL). All spans share the session `trace_id`, forming one trace per
+  execution.
+- SDK 1.1.8 sends to `https://app.neatlogs.com/api/data/v2` (endpoint fixed in
+  `core.py`). A probe confirmed this endpoint is deprecated (404).
+- Real transport: `send_trace_v1()` makes a single `POST /v1/trace` per execution
+  (never per span), with `Authorization: Bearer <NEATLOGS_API_KEY>` and a nested JSON
+  object (`children`). The destination is configurable via `NEATLOGS_ENDPOINT`
+  (default `https://ingest.neatlogs.com/`). Evidence: trace
+  `5b5173b4db9c8f9b75b0c915d33ba0f1` (8 spans, HIGH, verified true) and probe traces
+  (2x, 06:43PM).
+- Without `NEATLOGS_API_KEY`, telemetry degrades to no-op (both `init` and
+  `send_trace_v1` skip sending).
 
-## 3. Persistência atómica (padrão Entire)
+## 3. Atomic persistence (Entire pattern)
 
-- `RunState.save_checkpoint()` grava `artifacts/checkpoint_<run_id>.json` via ficheiro
-  `.tmp` + `os.replace()` (atómico no mesmo filesystem).
-- O estado completo (plan, ledger, erros, tentativas, verificação, risco, relatório) é
-  persistido a cada transição de estado.
-- Os checkpoints locais complementam o commit linking do Entire
-  (`commit_linking: always`) já ativo no repositório (PR #1 merged, `3ac4c3c`).
-- entire-graph instalado (`doctor`: no_egress=true, CLI 0.11.4); index completo
-  (1.704 ficheiros, 49.508 símbolos); `search` bloqueia no Windows (documentado).
+- `RunState.save_checkpoint()` writes `artifacts/checkpoint_<run_id>.json` via a
+  `.tmp` file + `os.replace()` (atomic on the same filesystem).
+- The full state (plan, ledger, errors, attempts, verification, risk, report) is
+  persisted on every state transition.
+- Local checkpoints complement the Entire commit linking (`commit_linking: always`)
+  already active in the repository (PR #1 merged, `3ac4c3c`).
+- entire-graph installed (`doctor`: no_egress=true, CLI 0.11.4); full index (1,704
+  files, 49,508 symbols); `search` blocks on Windows (documented).
 
-## 4. Critérios de avaliação
+## 4. Evaluation criteria
 
-| Pilar obrigatório | Estado | Evidência |
+| Mandatory pillar | Status | Evidence |
 |---|---|---|
 | neatlogs | ✅ | trace `5b5173b4db9c8f9b75b0c915d33ba0f1` (8 spans, HIGH, verified true) |
-| Entire | ✅ | `commit_linking: always`, PR #1 (`3ac4c3c`), checkpoints atómicos locais |
-| cfo.ai | ⏳ | `docs/business_plan.pdf` em geração (matriz custo de tokens vs subscrições) |
+| Entire | ✅ | `commit_linking: always`, PR #1 (`3ac4c3c`), local atomic checkpoints |
+| cfo.ai | ⏳ | `docs/business_plan.pdf` being generated (token cost vs subscriptions matrix) |
 
-Pesos oficiais: PENDING (o servidor ainda não os anunciou; não fabricamos métricas da
-plataforma).
+Official weights: PENDING (the server has not announced them yet; we do not fabricate
+platform metrics).
 
-## 5. Instalação limpa
+## 5. Clean install
 
 ```powershell
 git clone https://github.com/NUNRIBHAC/Neathack-Agent.git
@@ -85,71 +105,86 @@ cd Neathack-Agent
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Copy-Item .env.example .env   # preencher com chaves reais; .env nunca é commitado
+Copy-Item .env.example .env   # fill in with real keys; .env is never committed
 ```
 
-## 6. Execução por modo
+## 6. Running by mode
 
-### Demo (dados sintéticos + falha simulada)
+### Demo (synthetic data + simulated failure)
 
-No `.env`:
+In `.env`:
 
 ```
 RUN_DEMO_FIXTURE_MODE=true
 INJECT_LOCAL_FAULT_SIMULATION=true
 ```
 
-Depois:
+Then:
 
 ```powershell
 python agent.py
 ```
 
-Resultado esperado: falha simulada na tentativa 1 (`Simulated Network Timeout Anomaly`),
-recuperação na tentativa 2, `+40.0%`, risco HIGH, verificação True.
+Expected result: simulated failure on attempt 1 (`Simulated Network Timeout Anomaly`),
+recovery on attempt 2, `+40.0%`, risk HIGH, verification True.
 
-Equivalente por variável de ambiente no PowerShell (não usar sintaxe bash):
+Equivalent via environment variables in PowerShell (do not use bash syntax):
 
 ```powershell
 $env:RUN_DEMO_FIXTURE_MODE="true"; $env:INJECT_LOCAL_FAULT_SIMULATION="true"; python agent.py
 ```
 
-### Live (Crustdata + Bedrock + neatlogs)
+CLI flags force the modes without touching `.env`:
 
-No `.env`:
+```powershell
+python agent.py --fixture --fault
+```
+
+`--resume <run_id>` restores `artifacts/checkpoint_<RUN_ID>.json` and continues from
+where it stopped.
+
+### Live (Crustdata + LLM + neatlogs)
+
+In `.env`:
 
 ```
 RUN_DEMO_FIXTURE_MODE=false
 INJECT_LOCAL_FAULT_SIMULATION=false
-CRUSTDATA_API_KEY=<chave real>
-NEATLOGS_API_KEY=<chave real>
+CRUSTDATA_API_KEY=<real key>
+NEATLOGS_API_KEY=<real key>
 NEATLOGS_ENDPOINT=https://ingest.neatlogs.com/
-BEDROCK_MODEL_ID=<modelId ativo em us-east-1>
+BEDROCK_MODEL_ID=<active modelId in us-east-1>
 ```
 
-Depois:
+LLM resolution order: if `LITELLM_API_KEY` is set, the agent first tries the LiteLLM
+proxy (OpenAI chat completions compatible API; `LITELLM_BASE_URL` and
+`LITELLM_MODEL_ID` are configurable); on failure it falls back to Bedrock; if both
+fail, the deterministic offline fallback is used.
+
+Then:
 
 ```powershell
-python agent.py "Detetar disrupções competitivas num domínio alvo usando crescimento de headcount." "openai.com"
+python agent.py --goal "Detect competitive disruptions in a target domain using headcount growth." --domain "openai.com"
 ```
 
-### Testes
+### Tests
 
 ```powershell
 pytest test_agent.py -v
 ```
 
-Os testes validam: captura do erro simulado, recuperação na tentativa 2, recálculo de
-+40.0%, risco HIGH e verificação True.
+The tests validate: simulated error capture, recovery on attempt 2, exact +40.0%
+recompute, risk HIGH, verification True and the real `/v1/trace` payload contract
+(5 tests).
 
-## 7. Credenciais e segurança
+## 7. Credentials and security
 
-- Nenhuma chave real é versionada. `.env.example` contém placeholders; `.env` está no
+- No real key is versioned. `.env.example` contains placeholders; `.env` is in
   `.gitignore`.
-- O agente valida o formato do domínio alvo antes de qualquer chamada de rede.
-- Se o log for partilhado, rodar as chaves AWS/Crustdata/neatlogs antes de expor.
+- The agent validates the target domain format before any network call.
+- If the log is shared, rotate the AWS/Crustdata/neatlogs keys before exposing it.
 
-## 8. Dependências
+## 8. Dependencies
 
 ```
 requests==2.34.2
