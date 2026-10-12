@@ -1,0 +1,115 @@
+{
+    "project_name": "DisruptRadar SaaS - Agente de Inteligência Competitiva",
+    "archetype": "Swiss High-Contrast & Tactical Obsidian Intelligence (VC / Corporate Dev Deal Flow)",
+    "emotional_tone": "Tactical precision, authoritative intelligence, high-density clarity, executive urgency",
+    "theme_preference": "Dark Mode First (Obsidian Vault aesthetic with deep #090A0F canvas and crisp micro-borders)",
+    "typography": {
+      "heading_font": "Cabinet Grotesk, Outfit, sans-serif",
+      "mono_font": "JetBrains Mono, Source Code Pro, monospace",
+      "body_font": "Plus Jakarta Sans, Manrope, sans-serif",
+      "hierarchy": {
+        "h1": "text-3xl sm:text-4xl lg:text-5xl font-extrabold tracking-tight font-display",
+        "h2": "text-xl sm:text-2xl lg:text-3xl font-bold tracking-tight",
+        "h3": "text-lg sm:text-xl font-semibold tracking-normal",
+        "subtitle": "text-sm sm:text-base text-slate-400 font-normal leading-relaxed",
+        "metric_value": "font-mono font-bold text-2xl lg:text-3xl tracking-tight",
+        "badge_text": "font-mono text-xs font-semibold uppercase tracking-wider",
+        "overline": "text-xs font-mono font-medium uppercase tracking-[0.2em] text-emerald-400/80"
+      }
+    },
+    "colors": {
+      "background": "#08090E",
+      "card_background": "#10131E",
+      "card_border": "#1E2436",
+      "card_hover_border": "#333D5C",
+      "primary_accent": "#3B82F6",
+      "primary_accent_hover": "#2563EB",
+      "signal_emerald": "#10B981",
+      "signal_amber": "#F59E0B",
+      "signal_crimson": "#EF4444",
+      "signal_purple": "#8B5CF6",
+      "text_primary": "#F8FAFC",
+      "text_secondary": "#94A3B8",
+      "text_muted": "#64748B",
+      "gradients": {
+        "radar_beam": "linear-gradient(135deg, rgba(59, 130, 246, 0.15) 0%, rgba(16, 185, 129, 0.05) 100%)",
+        "risk_high_glow": "linear-gradient(90deg, rgba(239, 68, 68, 0.15) 0%, transparent 100%)",
+        "scanning_line": "linear-gradient(90deg, transparent 0%, #3B82F6 50%, transparent 100%)"
+      }
+    },
+    "layout_and_spacing": {
+      "dashboard_grid": "grid grid-cols-1 md:grid-cols-4 lg:grid-cols-12 gap-4 lg:gap-6",
+      "container_padding": "p-4 sm:p-6 lg:p-8",
+      "card_padding": "p-5 sm:p-6",
+      "border_radius": "rounded-lg border border-[#1E2436] bg-[#10131E]",
+      "bento_spans": {
+        "metrics_summary": "col-span-full lg:col-span-12 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4",
+        "primary_watchlist": "col-span-full lg:col-span-8 row-span-2",
+        "live_pipeline_feed": "col-span-full lg:col-span-4 row-span-2",
+        "company_headcount_chart": "col-span-full lg:col-span-8",
+        "executive_report_panel": "col-span-full lg:col-span-4"
+      }
+    },
+    "components": {
+      "workspace_switcher": "Shadcn Select customized with workspace icons, domain counter badges, and create workspace modal",
+      "watchlist_table": "Dense data table with company domain, tags, headcount status, delta percentage badge, risk badge (LOW/MEDIUM/HIGH), last run timestamp, and quick trigger actions",
+      "run_now_button": "Pill button with dynamic scan pulse effect, active polling step indicators (plan -> fetch -> analyze -> verify -> risk -> report)",
+      "risk_badge": "High contrast pill with status dot: LOW (emerald), MEDIUM (amber), HIGH (crimson with pulse halo)",
+      "headcount_time_series_chart": "Recharts ResponsiveContainer AreaChart with dual lines (headcount actual vs baseline prediction), custom glass tooltip, and interval toggles (7D, 30D, 90D, 1Y)",
+      "executive_report_rendered": "Structured markdown preview panel with AI executive summary, key risk flags, headcount delta analysis, social signals, and export PDF / Slack share buttons",
+      "slack_integration_panel": "Webhook URL config, notification rules (Risk >= MEDIUM, Headcount delta > 10%), live test notification trigger with status feedback",
+      "run_history_timeline": "Vertical stepper timeline showing execution duration, trace links, status (SUCCESS/FAILED), logs expansion panel"
+    },
+    "image_urls": {
+      "company_logos": [
+        {
+          "url": "https://images.unsplash.com/photo-1655196601100-8bfb26cf99e9?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzR8MHwxfHNlYXJjaHwyfHx0ZWNoJTIwc3RhcnR1cCUyMGxvZ29zJTIwY29tcGFueSUyMGF2YXRhcnMlMjBWQyUyMGFuYWx5dGljc3xlbnwwfHx8fDE3OTE3ODczNjB8MA&ixlib=rb-4.1.0&q=85",
+          "description": "Tech Venture Icon 1",
+          "category": "company_logo"
+        },
+        {
+          "url": "https://images.unsplash.com/photo-1671115544423-e5ecf3d6673d?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NzR8MHwxfHNlYXJjaHwxfHx0ZWNoJTIwc3RhcnR1cCUyMGxvZ29zJTIwY29tcGFueSUyMGF2YXRhcnMlMjBWQyUyMGFuYWx5dGljc3xlbnwwfHx8fDE3OTE3ODczNjB8MA&ixlib=rb-4.1.0&q=85",
+          "description": "Tech Venture Icon 2",
+          "category": "company_logo"
+        }
+      ],
+      "analyst_avatars": [
+        {
+          "url": "https://images.unsplash.com/photo-1573497019940-1c28c88b4f3e?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzV8MHwxfHNlYXJjaHwyfHxjb3Jwb3JhdGUlMjBwb3J0cmFpdCUyMGV4ZWN1dGl2ZSUyMGF2YXRhciUyMGhlYWRzaG90fGVufDB8fHx8MTc5MTc4NzM2NXww&ixlib=rb-4.1.0&q=85",
+          "description": "Head of Strategic Intelligence Avatar",
+          "category": "user_avatar"
+        },
+        {
+          "url": "https://images.unsplash.com/photo-1560250097-0b93528c311a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzV8MHwxfHNlYXJjaHwxfHxjb3Jwb3JhdGUlMjBwb3J0cmFpdCUyMGV4ZWN1dGl2ZSUyMGF2YXRhciUyMGhlYWRzaG90fGVufDB8fHx8MTc5MTc4NzM2NXww&ixlib=rb-4.1.0&q=85",
+          "description": "Partner Deal Flow Lead Avatar",
+          "category": "user_avatar"
+        },
+        {
+          "url": "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzV8MHwxfHNlYXJjaHw0fHxjb3Jwb3JhdGUlMjBwb3J0cmFpdCUyMGV4ZWN1dGl2ZSUyMGF2YXRhciUyMGhlYWRzaG90fGVufDB8fHx8MTc5MTc4NzM2NXww&ixlib=rb-4.1.0&q=85",
+          "description": "VC Analyst Avatar",
+          "category": "user_avatar"
+        }
+      ]
+    },
+    "motion_and_interactions": {
+      "run_polling_animation": "Step-by-step radar beacon highlight (plan -> fetch -> analyze -> verify -> risk -> report) with active spinner and live trace log stream",
+      "chart_hover": "Smooth active dot scaling + crosshair line + frosted glass custom tooltip with delta comparison",
+      "card_hover": "Border glow transition from #1E2436 to #333D5C with subtle 2px Y-axis lift",
+      "micro_interactions": "Sonner toast notifications on watch additions, domain analysis completed, Slack webhook tested, export downloaded"
+    },
+    "accessibility_and_testing": {
+      "contrast": "All text elements adhere to APCA/WCAG AA standards on dark background (#08090E)",
+      "data_testid_policy": "All interactive buttons, inputs, filter tabs, company table rows, risk badges, run actions, workspace selectors MUST include explicit role-based data-testid attributes (e.g. data-testid='run-analysis-button', data-testid='watchlist-domain-input', data-testid='risk-badge-high')",
+      "keyboard_nav": "Full dialog and tab navigation accessibility via keyboard focus rings"
+    },
+    "instructions_to_main_agent": [
+      "Follow React JavaScript conventions (.js / .jsx).",
+      "Implement the 6-stage intelligence agent pipeline loop visually: plan -> fetch -> analyze -> verify -> risk -> report.",
+      "Provide demo mock datasets for top VC targets (e.g., AI startups, FinTech scaleups, DevTools) with real domain watchlist items, tags, headcount historical data points, and generated executive reports.",
+      "Include workspace switcher functionality (e.g., 'Fund I - Early Stage', 'Corporate Dev - Cybersecurity', 'SaaS Benchmark')",
+      "Ensure 'Analisar agora' button triggers live simulation of polling pipeline with realistic progress steps and immediate UI update.",
+      "Include headcount time-series interactive chart using Recharts with date range toggle.",
+      "Render rich formatted executive report view with key findings, risk assessment, talent growth velocity, and Slack push status.",
+      "Use Sonner for toast notifications and ensure code uses custom dark high-contrast theme classes."
+    ]
+  }
