@@ -276,6 +276,31 @@ effective delivery cost of €2.59875/domain/month, with €3,000 annual fixed c
 required 13.375% reduction versus €3. That discount is not confirmed. The calculation
 uses Pro-equivalent customer-months, not an Enterprise sales mix.
 
+## 10. Dodo Payments (implemented, pending activation)
+
+Dodo Payments is fully implemented in the code, nothing was removed. It is not
+activated yet because the configuration depends on the Dodo dashboard.
+
+**Already implemented and working:**
+
+- Backend (`/app/backend/billing.py` + routes in `server.py`):
+  - `POST /api/billing/checkout` -> creates the Dodo checkout session
+  - `POST /api/dodo/webhook/` -> receives the signed webhook and switches the
+    workspace to Pro automatically
+  - `GET /api/billing/status`
+- Frontend: "Upgrade to Pro" button in the Plan & billing card in Settings, plus the
+  `/billing/return` page.
+- The Dodo API key is already in `.env`.
+
+**What is missing (2 values from the Dodo dashboard, test mode) to activate:**
+
+- Product ID of the Pro plan (`pdt_...`) -> `DODO_PRO_PRODUCT_ID` variable
+- Webhook signing secret -> `DODO_PAYMENTS_WEBHOOK_KEY` variable, registering the
+  endpoint `https://intel-radar-1.preview.emergentagent.com/api/dodo/webhook/`
+
+Until those two are defined, the "Upgrade to Pro" button returns 503 "Billing is not
+configured yet", which is the intended behaviour.
+
 <img width="425" height="92" alt="Captura de ecrã 2026-10-12 124306" src="https://github.com/user-attachments/assets/51418494-b055-4f5b-810c-0ac79d5ff389" />
 <img width="220" height="67" alt="Captura de ecrã 2026-10-12 124418" src="https://github.com/user-attachments/assets/148832b2-3f39-4d37-b9a0-ca3fb803095a" />
 <img width="177" height="46" alt="Captura de ecrã 2026-10-12 124325" src="https://github.com/user-attachments/assets/ab29ed98-f9c5-4c20-90c5-0c327f1009fe" />
